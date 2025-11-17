@@ -127,7 +127,7 @@ def main(
     original_num_pipelines = num_pipelines
     original_waiting_seconds_mean = waiting_seconds_mean
 
-    for batch_idx in range(3):
+    for batch_idx in range(n_traces):
         # Scale parameters by 2^batch_idx (1x, 2x, 4x)
         scale_factor = 2**batch_idx
         batch_params = base_params.copy()
@@ -140,7 +140,7 @@ def main(
         trace_files.extend(batch_trace_files)
 
     print(
-        f"\nGenerated {len(trace_files)} total trace files across 3 parameter configurations"
+        f"\nGenerated {len(trace_files)} total trace files across {n_traces} parameter configurations"
     )
 
     # Establish a baseline result by running policies
@@ -181,7 +181,7 @@ def main(
         print(f"Generated policy key: {policy_key}")
 
         # Generate policy with feedback from previous attempts
-        user_request = get_user_request(policy_key)
+        user_request = get_user_request(policy_key, metric)
         generated_policy_code, policy_filepath = generate_and_save_policy(
             user_request,
             verbose=verbose,

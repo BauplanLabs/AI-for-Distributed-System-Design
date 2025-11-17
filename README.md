@@ -10,13 +10,13 @@ The main idea in the paper is to use repeated sampling from frontier LLMs to imp
 
 ## Setup
 
-### API Keys
+### API Keys for hosted LLMs
 
-Create a `.env` file in the `src` directory by copying `local.env` and filling it with your API keys (note: you can leave blanks the LLLM keys of models you don't plan to use). Since the paper reports results from both Anthropic and OpenAI models, the local file includes placheholders for both.
+Create a `.env` file in the `src` directory by copying `local.env` and filling it with your API keys. Since the paper reports results from both Anthropic and OpenAI models, the local file includes placheholders for both, and the `main.py` script *assert* on both keys being present - please modify as needed if you wish to use only one of the two providers.
 
 ### Python environment
 
-We use `uv` to manage the Python environment. To set up the environment, run:
+We use `uv` to manage the Python environment. To set up the environment, just run:
 
 ```bash
 uv sync

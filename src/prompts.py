@@ -25,23 +25,23 @@ Available classes and their usage based on the examples:
 - Pipeline has .priority and .values (list of operators)
 - Failure has .priority, .ops, .cid, .pool_id, .ram, .cpu, .error
 
-Do NOT include any explanations, markdown formatting, or import statements. Return ONLY the Python code for the policy functions, and use the function docstring
-to briefly explain the logic of your policy, as it if were a normal comment in the code. If you make use of any new helper functions, define them within the same code block and make sure to add the relevant
+Do NOT include any explanations, markdown formatting, or import statements. Return ONLY the code for the policy functions, but rememember to add comments inside the Python code itself to clearly explain the logic of your policy, and use the function docstring
+to give an overview of the main idea as if it were a standard functin comment. If you make use of any new helper functions, define them within the same code block and make sure to add the relevant
 import statements inside the function itself, should they be needed.
 """
 
 
-def get_user_request(policy_key: str) -> str:
+def get_user_request(policy_key: str, metric: str) -> str:
     """Generate user request with the provided policy key.
 
     Args:
         policy_key: The policy key that the LLM should use in @register_scheduler decorators
-
+        metric: The metric to focus on improving in the policy
     Returns:
         The formatted user request string
     """
     return f"""
-Starting from the naive policy provided as example, try to improve it, for example leveraging the concept of priority.
+Starting from the naive policy provided as example, try to improve it by focusing on improving {metric}, for example leveraging the concept of priority.
 Start with small improvements first, targeting obvious flaws, and make the policy complex gradually, only after you
 have working code and a direction for improvement. Make sure to consider the results of previous attempts and the feedback provided
 as you generate a new policy.
