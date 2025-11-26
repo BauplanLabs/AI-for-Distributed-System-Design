@@ -378,7 +378,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         choices=[
-            "claude-opus-4-1-20250805",
+            "claude-opus-4-5-20251101",
             "claude-sonnet-4-5-20250929",
             "gpt-5",
             "gpt-5-mini",

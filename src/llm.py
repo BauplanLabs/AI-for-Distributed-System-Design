@@ -138,10 +138,9 @@ def generate_policy_with_llm(
             messages.append({"role": "user", "content": entry["feedback"]})
 
     reasoning_effort = None
-    if model == "gpt-5" or model == "gpt-5-mini":
-        # leverage gpt-5's advanced capabilities and override the reasoning effort
+    if model == "gpt-5" or model == "gpt-5-mini" or model.startswith("claude-opus-4"):
+        # leverage advanced capabilities and override the reasoning effort
         reasoning_effort = "high"
-        # gpt-5 does not use temperature
         temperature = 1
 
     response = completion_with_retry(

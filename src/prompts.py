@@ -28,6 +28,8 @@ Available classes and their usage based on the examples:
 Do NOT include any explanations, markdown formatting, or import statements. Return ONLY the code for the policy functions, but rememember to add comments inside the Python code itself to clearly explain the logic of your policy, and use the function docstring
 to give an overview of the main idea as if it were a standard functin comment. If you make use of any new helper functions, define them within the same code block and make sure to add the relevant
 import statements inside the function itself, should they be needed.
+
+Do NOT generate your own poliy key - you MUST use exactly what is provided in the user request.
 """
 
 
