@@ -87,11 +87,11 @@ def run_simulation_with_trace(params, trace_file):
 
 
 @timing
-def generate_traces(k: int, base_params: dict):
+def generate_traces(k: int, base_params: dict, file_name_prefix: str):
     """Generate a bunch of traces with different parameters for length, concurrency etc."""
     traces = []
     for i in range(k):
-        trace_file_name = f"trace_{i}_{base_params['duration']}s.csv"
+        trace_file_name = f"{file_name_prefix}_{i}.csv"
         params = base_params.copy()
         # TODO: adjust whatever params we want, other than just seed
         params["random_seed"] = 10 + i

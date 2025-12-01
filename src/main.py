@@ -136,12 +136,19 @@ def main(
             original_waiting_seconds_mean * scale_factor
         )
         # Generate 2 traces for this batch
-        batch_trace_files = generate_traces(k=2, base_params=batch_params)
+        file_name_prefix = f"trace_scale{scale_factor}x_{base_params['duration']}s"
+        batch_trace_files = generate_traces(
+            k=2,
+            base_params=batch_params,
+            file_name_prefix=file_name_prefix,
+        )
         trace_files.extend(batch_trace_files)
+    assert len(trace_files) == len(set(trace_files))
 
     print(
         f"\nGenerated {len(trace_files)} total trace files across {n_traces} parameter configurations"
     )
+    print("Traces:", ", ".join(trace_files))
 
     # Establish a baseline result by running policies
     print("\nRunning baseline policies...")
