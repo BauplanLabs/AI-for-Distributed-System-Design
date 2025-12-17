@@ -210,3 +210,7 @@ __marimo__/
 
 eudoxia/
 policies/
+
+training_logs/
+
+.claude/

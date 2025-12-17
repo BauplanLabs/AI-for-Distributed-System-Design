@@ -5,9 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "chz>=0.4.0",
     "eudoxia",
     "litellm>=1.77.5",
+    "pandas>=2.0.0",
+    "plotly>=5.18.0",
     "python-dotenv>=1.1.1",
+    "streamlit>=1.52.1",
+    "tinker>=0.7.0",
+    "torch>=2.0.0",
     "wonderwords>=2.2.0",
 ]
 
