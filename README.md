@@ -41,7 +41,9 @@ argument parser directly.
 
 ## Bonus: an RL loop with Tinker
 
-As an alternative to the iterative sampling approach, you can fine-tune an LLM using reinforcement learning with [Tinker](https://github.com/thinking-machines-lab/tinker-cookbook). The `training.py` script implements a LoRA-based RL loop where the simulator reward guides weight updates.
+As an alternative to the iterative sampling approach, you can fine-tune an LLM using reinforcement learning with [Tinker](https://github.com/thinking-machines-lab/tinker-cookbook). The `training.py` script implements a LoRA-based RL loop where the simulator reward guides weight updates. 
+
+The script is only a first stub in moving to fine-tuning and it was not included in the original paper - make sure to have a `TINKER_API_KEY` set in your `.env` file to run the training script:
 
 ```bash
 uv run python src/training.py
