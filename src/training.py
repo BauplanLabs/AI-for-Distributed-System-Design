@@ -6,9 +6,13 @@ for the Eudoxia simulator. The simulation provides continuous rewards based
 on throughput or latency metrics.
 
 Usage:
+    # Start fresh training
     uv run python src/training.py
     uv run python src/training.py metric=latency
-    uv run python src/training.py model_name='openai/gpt-oss-20b' batch_size=4
+    uv run python src/training.py model_name='Qwen/Qwen3-30B-A3B-Instruct-2507'
+
+    # Resume from checkpoint
+    uv run python src/training.py checkpoint='tinker://89dfc3d1-4932-5270-bd0f-4245fcb628df:train:0/weights/step_000010'
 """
 
 import json
@@ -211,6 +215,9 @@ class Config:
     save_every: int = 10
     max_tokens: int = 4096
     num_epochs: int = 1
+    # Checkpoint resumption - provide a tinker path like:
+    # tinker://89dfc3d1-4932-5270-bd0f-4245fcb628df:train:0/weights/step_000010
+    checkpoint: str | None = None
     # Simulation parameters
     metric: str = "throughput"  # "throughput" or "latency"
     duration: int = 60
@@ -462,6 +469,14 @@ def extract_job_id(tinker_path: str) -> str:
     return "unknown"
 
 
+def extract_step_from_checkpoint(checkpoint_path: str) -> int:
+    """Extract step number from checkpoint path like '.../step_000010'."""
+    match = re.search(r"step_(\d+)", checkpoint_path)
+    if match:
+        return int(match.group(1))
+    return 0
+
+
 def main(config: Config):
     """Main training loop."""
     # Setup logging
@@ -493,16 +508,26 @@ def main(config: Config):
     # Initialize Tinker client
     service_client = tinker.ServiceClient(base_url=config.base_url)
 
-    # Create training client
-    logger.info(f"Creating LoRA training client for {config.model_name}")
-    training_client = service_client.create_lora_training_client(
-        base_model=config.model_name,
-        rank=config.lora_rank,
-    )
+    # Create training client (from checkpoint or fresh)
+    if config.checkpoint:
+        logger.info(f"Resuming from checkpoint: {config.checkpoint}")
+        training_client = service_client.create_training_client_from_state_with_optimizer(
+            path=config.checkpoint,
+        )
+        job_id = extract_job_id(config.checkpoint)
+        start_step = extract_step_from_checkpoint(config.checkpoint) + 1
+        logger.info(f"Resuming from step {start_step}")
+    else:
+        logger.info(f"Creating LoRA training client for {config.model_name}")
+        training_client = service_client.create_lora_training_client(
+            base_model=config.model_name,
+            rank=config.lora_rank,
+        )
+        # Get job ID from initial state
+        initial_state_path = training_client.save_state(name="init").result().path
+        job_id = extract_job_id(initial_state_path)
+        start_step = 0
 
-    # Get job ID and create log directory
-    initial_state_path = training_client.save_state(name="init").result().path
-    job_id = extract_job_id(initial_state_path)
     logger.info(f"Tinker job ID: {job_id}")
 
     job_log_path = Path(config.log_path) / job_id
@@ -536,15 +561,39 @@ def main(config: Config):
     )
     logger.info(f"Batch size: {config.batch_size}, Group size: {config.group_size}")
 
-    global_step = 0
+    global_step = start_step
     metrics_history = []
     samples_log_path = job_log_path / "generated_policies.jsonl"
-    policy_counter = 0
+    metrics_path = job_log_path / "metrics.jsonl"
+    # Policy counter ensures unique keys even when resuming
+    policy_counter = start_step * config.batch_size * config.group_size
+
+    # Save job info at the start (so we can track progress)
+    job_info_path = job_log_path / "job_info.json"
+    job_info = {
+        "job_id": job_id,
+        "model_name": config.model_name,
+        "checkpoint": config.checkpoint,
+        "metric": config.metric,
+        "baseline_metric": baseline_metric,
+        "num_traces": len(trace_files),
+        "batch_size": config.batch_size,
+        "group_size": config.group_size,
+        "learning_rate": config.learning_rate,
+        "lora_rank": config.lora_rank,
+        "num_epochs": config.num_epochs,
+        "start_step": start_step,
+    }
+    with open(job_info_path, "w") as f:
+        json.dump(job_info, f, indent=2)
+    logger.info(f"Job info saved to {job_info_path}")
 
     for epoch in range(config.num_epochs):
         logger.info(f"=== Epoch {epoch + 1}/{config.num_epochs} ===")
 
-        for batch_idx in range(n_batches):
+        # When resuming, skip already-completed batches
+        start_batch = start_step if epoch == 0 else 0
+        for batch_idx in range(start_batch, n_batches):
             t_start = time.time()
 
             # Save checkpoint periodically
@@ -752,10 +801,14 @@ def main(config: Config):
                 f"datums={len(training_datums)}"
             )
 
-            # Save samples to file
+            # Save samples to file (append)
             with open(samples_log_path, "a") as f:
                 for sample in batch_samples:
                     f.write(json.dumps(sample) + "\n")
+
+            # Save metrics incrementally (append)
+            with open(metrics_path, "a") as f:
+                f.write(json.dumps(metrics) + "\n")
 
             # Print one example
             if batch_samples:
@@ -777,33 +830,14 @@ def main(config: Config):
     final_path = training_client.save_state(name="final").result().path
     logger.info(f"Final checkpoint saved to {final_path}")
 
-    # Save metrics history
-    metrics_path = job_log_path / "metrics.jsonl"
-    with open(metrics_path, "w") as f:
-        for m in metrics_history:
-            f.write(json.dumps(m) + "\n")
-    logger.info(f"Metrics saved to {metrics_path}")
-    logger.info(f"Generated policies saved to {samples_log_path}")
-
-    # Save job info
-    job_info_path = job_log_path / "job_info.json"
-    job_info = {
-        "job_id": job_id,
-        "model_name": config.model_name,
-        "metric": config.metric,
-        "baseline_metric": baseline_metric,
-        "num_traces": len(trace_files),
-        "batch_size": config.batch_size,
-        "group_size": config.group_size,
-        "learning_rate": config.learning_rate,
-        "lora_rank": config.lora_rank,
-        "num_epochs": config.num_epochs,
-        "final_checkpoint": final_path,
-    }
+    # Update job info with final checkpoint
+    job_info["final_checkpoint"] = final_path
+    job_info["final_step"] = global_step
     with open(job_info_path, "w") as f:
         json.dump(job_info, f, indent=2)
-    logger.info(f"Job info saved to {job_info_path}")
 
+    logger.info(f"Metrics saved to {metrics_path}")
+    logger.info(f"Generated policies saved to {samples_log_path}")
     logger.info("Training completed!")
 
 
