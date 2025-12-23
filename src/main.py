@@ -7,13 +7,14 @@ import statistics
 # eudoxia-specific imports
 from eudoxia.simulator import get_param_defaults
 from eudoxia.scheduler import register_scheduler_init, register_scheduler  # noqa: F401
-from eudoxia.executor import Failure, Suspend, Assignment  # noqa: F401
-from eudoxia.workload import WorkloadGenerator, Pipeline, Operator  # noqa: F401
+from eudoxia.executor import ExecutionResult, Suspend, Assignment  # noqa: F401
+from eudoxia.workload import WorkloadGenerator, Pipeline, Operator, OperatorState, ASSIGNABLE_STATES  # noqa: F401
 from eudoxia.utils import Priority  # noqa: F401
 
 # import utils
 from simulation_utils import (
     generate_traces,
+    get_raw_stats_for_policy,
     get_stats_for_policy,
 )
 
@@ -71,16 +72,17 @@ def main(
     duration: int = 60,
     ticks_per_second: int = 1000,
     num_pools: int = 1,
-    cpu_pool: int = 64,
-    ram_pool: int = 500,
+    cpus_per_pool: int = 64,
+    ram_gb_per_pool: int = 500,
     num_pipelines: int = 20,
     num_operators: int = 5,
     waiting_seconds_mean: float = 5,
+    multi_operator_containers: bool = False,
     max_iterations: int = 5,
     verbose: bool = False,
     model: str = "claude-sonnet-4-5-20250929",
     temperature: float = 0.7,
-    metric: str = "throughput",
+    metric: str = "latency",
 ):
     """Main function for policy generation and simulation.
 
@@ -89,11 +91,12 @@ def main(
         duration: Simulation duration in seconds
         ticks_per_second: Number of simulation ticks per second
         num_pools: Number of resource pools
-        cpu_pool: Number of CPUs per pool
-        ram_pool: Amount of RAM per pool (GB)
+        cpus_per_pool: Number of CPUs per pool
+        ram_gb_per_pool: Amount of RAM per pool (GB)
         num_pipelines: Number of pipelines in the workload
         num_operators: Number of operators per pipeline
         waiting_seconds_mean: Mean waiting time in seconds for workload generation
+        multi_operator_containers: Whether to allow multiple operators per container
         verbose: Whether to print detailed output
         max_iterations: Maximum number of policy generation iterations
         model: LLM model to use for policy generation
@@ -110,11 +113,12 @@ def main(
     base_params["duration"] = duration
     base_params["ticks_per_second"] = ticks_per_second
     base_params["num_pools"] = num_pools
-    base_params["cpu_pool"] = cpu_pool
-    base_params["ram_pool"] = ram_pool
+    base_params["cpus_per_pool"] = cpus_per_pool
+    base_params["ram_gb_per_pool"] = ram_gb_per_pool
     base_params["num_pipelines"] = num_pipelines
     base_params["num_operators"] = num_operators
     base_params["waiting_seconds_mean"] = waiting_seconds_mean
+    base_params["multi_operator_containers"] = multi_operator_containers
     base_params["interactive_prob"] = 0.3
     base_params["query_prob"] = 0.1
     base_params["batch_prob"] = 0.6
@@ -153,7 +157,8 @@ def main(
     # Establish a baseline result by running policies
     print("\nRunning baseline policies...")
     print("First, running 'naive' policy...")
-    naive_stats = get_stats_for_policy(base_params, trace_files, "naive", metric)
+    naive_raw_stats = get_raw_stats_for_policy(base_params, trace_files, "naive")
+    naive_stats = get_stats_for_policy(naive_raw_stats, metric)
     baseline_median_metric = statistics.median(naive_stats)
     print_policy_stats("naive", naive_stats, prefix="Baseline", metric=metric)
     print("\n" + "=" * 60)
@@ -223,9 +228,10 @@ def main(
             f"\nRunning simulator with policy: {policy_key} (saved to {policy_filepath})"
         )
         try:
-            policy_stats = get_stats_for_policy(
-                base_params, trace_files, policy_key, metric
+            policy_raw_stats = get_raw_stats_for_policy(
+                base_params, trace_files, policy_key
             )
+            policy_stats = get_stats_for_policy(policy_raw_stats, metric)
             median_metric = statistics.median(policy_stats)
 
             print_policy_stats(policy_key, policy_stats, metric=metric)
@@ -236,6 +242,7 @@ def main(
             else:  # throughput
                 is_better = median_metric > best_median_metric
 
+            # TODO: Include JSON stats in feedback via [s.to_dict() for s in policy_raw_stats]
             if is_better:
                 improvement_direction = (
                     "decreased" if metric == "latency" else "improved"
@@ -348,10 +355,10 @@ if __name__ == "__main__":
         "--num-pools", type=int, default=1, help="Number of resource pools"
     )
     parser.add_argument(
-        "--cpu-pool", type=int, default=64, help="Number of CPUs per pool"
+        "--cpus-per-pool", type=int, default=64, help="Number of CPUs per pool"
     )
     parser.add_argument(
-        "--ram-pool", type=int, default=500, help="Amount of RAM per pool (GB)"
+        "--ram-gb-per-pool", type=int, default=500, help="Amount of RAM per pool (GB)"
     )
     parser.add_argument(
         "--num-pipelines",
@@ -368,6 +375,11 @@ if __name__ == "__main__":
         default=10.0,
         help="Mean waiting time in seconds for workload generation",
     )
+    parser.add_argument(
+        "--multi-operator-containers",
+        action="store_true",
+        help="Allow multiple operators per container (default: false)",
+    )
     # experimentation parameters
     parser.add_argument(
         "--max-iterations",
@@ -378,7 +390,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--metric",
         choices=["throughput", "latency"],
-        default="throughput",
+        default="latency",
         help="Metric to optimize - 'throughput' (higher is better) or 'latency' (lower is better)",
     )
     # LLM parameters
@@ -412,11 +424,12 @@ if __name__ == "__main__":
         duration=args.duration,
         ticks_per_second=args.ticks_per_second,
         num_pools=args.num_pools,
-        cpu_pool=args.cpu_pool,
-        ram_pool=args.ram_pool,
+        cpus_per_pool=args.cpus_per_pool,
+        ram_gb_per_pool=args.ram_gb_per_pool,
         num_pipelines=args.num_pipelines,
         num_operators=args.num_operators,
         waiting_seconds_mean=args.waiting_seconds_mean,
+        multi_operator_containers=args.multi_operator_containers,
         max_iterations=args.max_iterations,
         verbose=args.verbose,
         model=args.model,
