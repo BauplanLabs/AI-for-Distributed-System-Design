@@ -191,7 +191,12 @@ def generate_and_save_policy(
     # Build context
     if verbose:
         print("Building system context from markdown files...")
-    starter_template = SCHEDULER_TEMPLATE.format(scheduler_name="example")
+
+    # start at the init, stripping the prior imports (because we instruct the LLM not to import anything else)
+    #
+    # TODO: why not just let it import what it needs, and run the generated .py as its own process?
+    starter_template = SCHEDULER_TEMPLATE[SCHEDULER_TEMPLATE.index("@register_scheduler_init"):]
+    starter_template = starter_template.format(scheduler_name="example")
     system_context = build_system_context(
         files=["eudoxia_bauplan.md"],
         sections={"Starter Scheduler Template": f"```python\n{starter_template}\n```"},

@@ -5,11 +5,14 @@ from dotenv import load_dotenv
 import statistics
 
 # eudoxia-specific imports
-from eudoxia.simulator import get_param_defaults
-from eudoxia.scheduler import register_scheduler_init, register_scheduler  # noqa: F401
-from eudoxia.executor import ExecutionResult, Suspend, Assignment  # noqa: F401
-from eudoxia.workload import WorkloadGenerator, Pipeline, Operator, OperatorState, ASSIGNABLE_STATES  # noqa: F401
+from typing import List, Tuple  # noqa: F401
+from eudoxia.workload import Pipeline, OperatorState  # noqa: F401
+from eudoxia.workload.runtime_status import ASSIGNABLE_STATES  # noqa: F401
+from eudoxia.executor.assignment import Assignment, ExecutionResult, Suspend  # noqa: F401
+from eudoxia.scheduler.decorators import register_scheduler_init, register_scheduler  # noqa: F401
 from eudoxia.utils import Priority  # noqa: F401
+from eudoxia.simulator import get_param_defaults  # noqa: F401
+
 
 # import utils
 from simulation_utils import (
@@ -206,7 +209,7 @@ def main(
         # Execute the generated policy code
         print(f"\nExecuting generated policy code (iteration {iteration + 1})...")
         try:
-            exec(generated_policy_code)
+            exec(generated_policy_code, globals())
             print("✅ Policy code is valid Python!")
             print(f"📝 Using scheduler key: {policy_key}")
         except Exception as e:
