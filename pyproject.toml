@@ -18,4 +18,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-eudoxia = { git = "https://github.com/BauplanLabs/eudoxia", rev = "main" }
+eudoxia = { git = "https://github.com/BauplanLabs/eudoxia", rev = "84214231b0c4c244c04bbda79d236b954abd1a91" }

@@ -9,21 +9,24 @@ Your response should be ONLY valid Python code that:
 1. Uses the @register_scheduler_init decorator with the EXACT key provided in the user request (do NOT generate your own key)
 2. Uses the @register_scheduler decorator with the SAME EXACT key provided in the user request
 3. Implements the init function to set up any necessary state on the scheduler object `s`
-4. Implements the scheduler function with the correct signature: (s, failures: List[Failure], pipelines: List[Pipeline]) -> Tuple[List[Suspend], List[Assignment]]
+4. Implements the scheduler function with the correct signature: (s, results: List[ExecutionResult], pipelines: List[Pipeline]) -> Tuple[List[Suspend], List[Assignment]]
 5. Returns proper suspensions and assignments lists
 6. Follow the access patterns from the examples, especially for accessing executor pools and creating Assignment objects
 
 Available classes and their usage based on the examples:
 - Priority.QUERY, Priority.INTERACTIVE, Priority.BATCH_PIPELINE - priority levels
-- Assignment(ops=op_list, cpu=cpu_amount, ram=ram_amount, priority=priority, pool_id=pool_id) - to create assignments
-- Suspend(cid, pool_id) - to create suspensions
+- Assignment(ops=op_list, cpu=cpu_amount, ram=ram_amount, priority=priority, pool_id=pool_id, pipeline_id=pipeline.pipeline_id) - to create assignments
+- Suspend(container_id, pool_id) - to create suspensions
 - s.executor.num_pools - number of available pools
 - s.executor.pools[i].avail_cpu_pool - available CPU in pool i
 - s.executor.pools[i].avail_ram_pool - available RAM in pool i
 - s.executor.pools[i].max_cpu_pool - max CPU in pool i
 - s.executor.pools[i].max_ram_pool - max RAM in pool i
-- Pipeline has .priority and .values (list of operators)
-- Failure has .priority, .ops, .cid, .pool_id, .ram, .cpu, .error
+- Pipeline has .priority, .pipeline_id, .values (DAG of operators), and .runtime_status() method
+- ExecutionResult has .priority, .ops, .container_id, .pool_id, .ram, .cpu, .error, and .failed() method
+- pipeline.runtime_status().get_ops(states, require_parents_complete=True/False) - get operators matching criteria
+- pipeline.runtime_status().is_pipeline_successful() - returns True if all operators completed
+- OperatorState enum - PENDING, ASSIGNED, RUNNING, SUSPENDING, COMPLETED, FAILED (ASSIGNABLE_STATES lists states that can transition to ASSIGNED: PENDING and FAILED)
 
 Do NOT include any explanations, markdown formatting, or import statements. Return ONLY the code for the policy functions, but rememember to add comments inside the Python code itself to clearly explain the logic of your policy, and use the function docstring
 to give an overview of the main idea as if it were a standard functin comment. If you make use of any new helper functions, define them within the same code block and make sure to add the relevant

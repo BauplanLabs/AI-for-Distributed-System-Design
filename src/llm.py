@@ -8,26 +8,34 @@ import time
 import litellm
 from litellm import completion
 from prompts import POLICY_GENERATION_SYSTEM_PROMPT
+from eudoxia.__main__ import SCHEDULER_TEMPLATE
 
 
 # Global cost tracking
 _response_costs = []
 
 
-def build_system_context():
-    """Build the system context from markdown files"""
+def build_system_context(files=[], sections={}):
+    """Build the system context from markdown files and additional sections.
+
+    Args:
+        files: List of filenames in src/markdown/ to read and include
+        sections: Dict mapping section names to content strings
+
+    Returns:
+        Combined context string
+    """
     context_parts = []
     markdown_dir = Path("src/markdown")
 
-    # Read the markdown files in a specific order for coherence
-    file_order = ["eudoxia_bauplan.md", "policy_examples.md"]
-
-    for filename in file_order:
+    for filename in files:
         filepath = markdown_dir / filename
-        if filepath.exists():
-            with open(filepath, "r") as f:
-                content = f.read()
-                context_parts.append(f"# {filename}\n{content}")
+        with open(filepath, "r") as f:
+            content = f.read()
+            context_parts.append(f"# {filename}\n{content}")
+
+    for section_name, content in sections.items():
+        context_parts.append(f"# {section_name}\n{content}")
 
     return "\n\n".join(context_parts)
 
@@ -143,12 +151,14 @@ def generate_policy_with_llm(
         reasoning_effort = "high"
         temperature = 1
 
+    print(f"sending {len(messages)} messages to {model}")
     response = completion_with_retry(
         model=model,
         messages=messages,
         temperature=temperature,
         reasoning_effort=reasoning_effort,
     )
+    print(f"got response from {model}")
 
     return response.choices[0].message.content
 
@@ -181,7 +191,16 @@ def generate_and_save_policy(
     # Build context
     if verbose:
         print("Building system context from markdown files...")
-    system_context = build_system_context()
+
+    # start at the init, stripping the prior imports (because we instruct the LLM not to import anything else)
+    #
+    # TODO: why not just let it import what it needs, and run the generated .py as its own process?
+    starter_template = SCHEDULER_TEMPLATE[SCHEDULER_TEMPLATE.index("@register_scheduler_init"):]
+    starter_template = starter_template.format(scheduler_name="example")
+    system_context = build_system_context(
+        files=["eudoxia_bauplan.md"],
+        sections={"Starter Scheduler Template": f"```python\n{starter_template}\n```"},
+    )
 
     # Generate policy
     if verbose:
@@ -200,7 +219,8 @@ def generate_and_save_policy(
     filepath = save_policy_to_file(generated_code, user_request, policy_key)
 
     # Extract the policy key from the generated code to verify it matches
-    key_match = re.search(r'@register_scheduler\("([^"]+)"\)', generated_code)
+    # Handle both @register_scheduler("key") and @register_scheduler(key="key") syntax
+    key_match = re.search(r'@register_scheduler\((?:key=)?"([^"]+)"\)', generated_code)
     extracted_key = key_match.group(1) if key_match else "generated_policy"
     assert extracted_key == policy_key, (
         f"Extracted key '{extracted_key}' does not match expected key '{policy_key}'"
