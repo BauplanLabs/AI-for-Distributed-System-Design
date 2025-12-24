@@ -16,14 +16,21 @@ from eudoxia.workload.csv_io import (
 test_policy_as_string = """
 @register_scheduler_init(key="policy2")
 def naive_pipeline_init(s):
-    s.waiting_queue: Tuple[List[Operator], Priority] = []
+    s.waiting_queue = []
 
 @register_scheduler(key="policy2")
-def naive_pipeline(s, failures: List[Failure],
-                   pipelines: List[Pipeline]) -> Tuple[List[Suspend], List[Assignment]]:
+def naive_pipeline(s, results, pipelines):
+    '''
+    A simple test scheduler that queues pipelines and assigns them FIFO.
+
+    Args:
+        results: List of ExecutionResult from previous tick (ignored here)
+        pipelines: List of newly arrived Pipeline objects
+    Returns:
+        Tuple of (suspensions, assignments)
+    '''
     for p in pipelines:
-        for op in p.values:
-            s.waiting_queue.append(([op], p.priority))
+        s.waiting_queue.append(p)
     if len(s.waiting_queue) == 0:
         return [], []
 
@@ -33,9 +40,11 @@ def naive_pipeline(s, failures: List[Failure],
         avail_cpu_pool = s.executor.pools[pool_id].avail_cpu_pool
         avail_ram_pool = s.executor.pools[pool_id].avail_ram_pool
         if avail_cpu_pool > 0 and avail_ram_pool > 0 and s.waiting_queue:
-            op_list, priority = s.waiting_queue.pop(0)
+            pipeline = s.waiting_queue.pop(0)
+            op_list = [op for op in pipeline.values]
             assignment = Assignment(ops=op_list, cpu=avail_cpu_pool, ram=avail_ram_pool,
-                                    priority=priority, pool_id=pool_id)
+                                    priority=pipeline.priority, pool_id=pool_id,
+                                    pipeline_id=pipeline.pipeline_id)
             assignments.append(assignment)
     return suspensions, assignments
 """.strip()
@@ -127,7 +136,7 @@ def get_raw_stats_for_policy(
     return stats
 
 
-def get_stats_for_policy(
+def extract_metrics_from_stats(
     # full SimulatorStats from get_raw_stats_for_policy
     raw_stats: List[SimulatorStats],
     # metric to return: "latency" or "throughput"
@@ -147,3 +156,27 @@ def get_stats_for_policy(
     else:
         assert metric == "throughput", f"Unknown metric: {metric}"
         return [s.throughput for s in raw_stats]
+
+
+def get_stats_for_policy(
+    base_params: dict,
+    trace_files: list,
+    policy_algorithm: str,
+    metric: str = "throughput",
+) -> List[float]:
+    """Run simulations and extract metric values for a given policy.
+
+    This is a convenience function that combines get_raw_stats_for_policy
+    and extract_metrics_from_stats.
+
+    Args:
+        base_params: Basic simulation parameters
+        trace_files: List of trace files to use as simulation input
+        policy_algorithm: Policy key to test
+        metric: Metric to return - either "latency" or "throughput"
+
+    Returns:
+        List of metric values (one per trace file)
+    """
+    raw_stats = get_raw_stats_for_policy(base_params, trace_files, policy_algorithm)
+    return extract_metrics_from_stats(raw_stats, metric)

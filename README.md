@@ -33,10 +33,10 @@ The `markdown` folder contains the "system prompts" used to prime the LLMs. The 
 If you wish to use default settings, you can just run a reasoning loop over the pre-defined amount of iterations with:
 
 ```bash
-uv run main.py
+uv run python src/main.py
 ```
 
-from the `src` directory. This will kick off a reasoning loop using the default parameters, and print the progress in the terminal: please refer to the paper for additional context on LLM sampling. For a list of all the supported command-line arguments, check the `main.py`
+from the project root directory. This will kick off a reasoning loop using the default parameters, and print the progress in the terminal: please refer to the paper for additional context on LLM sampling. For a list of all the supported command-line arguments, check the `main.py`
 argument parser directly.
 
 ## Bonus: an RL loop with Tinker

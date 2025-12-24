@@ -33,8 +33,9 @@ from tinker.types.tensor_data import TensorData
 # eudoxia imports for simulation
 from eudoxia.simulator import get_param_defaults
 from eudoxia.scheduler import register_scheduler_init, register_scheduler  # noqa: F401
-from eudoxia.executor import Failure, Suspend, Assignment  # noqa: F401
-from eudoxia.workload import WorkloadGenerator, Pipeline, Operator  # noqa: F401
+from eudoxia.executor import ExecutionResult, Suspend, Assignment  # noqa: F401
+from eudoxia.workload import WorkloadGenerator, Pipeline, Operator, OperatorState  # noqa: F401
+from eudoxia.workload.runtime_status import ASSIGNABLE_STATES  # noqa: F401
 from eudoxia.utils import Priority  # noqa: F401
 
 # local imports
@@ -307,41 +308,80 @@ priority-based scheduling, resource allocation strategies, and intelligent queue
 IMPORTANT: Use the following EXACT key in both @register_scheduler_init and @register_scheduler decorators: "{policy_key}"
 Do NOT generate your own key - you MUST use exactly: "{policy_key}"
 
+SCHEDULER FUNCTION SIGNATURE (MUST USE THIS EXACT SIGNATURE):
+def scheduler(s, results, pipelines):
+    '''
+    Args:
+        s: Scheduler state object (has s.executor, s.params, and any state you set in init)
+        results: List[ExecutionResult] - execution results from previous tick (successes AND failures)
+        pipelines: List[Pipeline] - newly arrived pipelines
+    Returns:
+        Tuple of (suspensions, assignments) where:
+        - suspensions: list of Suspend objects
+        - assignments: list of Assignment objects
+    '''
+
+KEY API REFERENCE:
+- ExecutionResult: r.ops, r.priority, r.pool_id, r.cpu, r.ram, r.container_id, r.error, r.failed()
+  - Use r.failed() to check if it's a failure (returns True if r.error is not None)
+  - Contains both successes and failures - filter with r.failed() as needed
+- Assignment: Assignment(ops=op_list, cpu=cpu_amount, ram=ram_amount, priority=priority, pool_id=pool_id, pipeline_id=pipeline.pipeline_id)
+- Suspend: Suspend(container_id, pool_id)
+- Pipeline: p.values (DAG of operators), p.priority (Priority enum), p.pipeline_id (string ID)
+- Pipeline runtime: p.runtime_status().get_ops(ASSIGNABLE_STATES, require_parents_complete=True/False)
+- Pipeline completion: p.runtime_status().is_pipeline_successful()
+- OperatorState: PENDING, ASSIGNED, RUNNING, SUSPENDING, COMPLETED, FAILED
+- ASSIGNABLE_STATES: states that can transition to ASSIGNED (PENDING, FAILED)
+- Pool resources: s.executor.pools[pool_id].avail_cpu_pool, .avail_ram_pool, .max_cpu_pool, .max_ram_pool
+- Priority levels: Priority.QUERY (highest), Priority.INTERACTIVE, Priority.BATCH_PIPELINE (lowest)
+
 COMMON MISTAKES TO AVOID:
-1. Operator objects do NOT have .cpu or .ram attributes. Do not try to access op.cpu or op.ram.
-2. CPU and RAM are allocated at the Assignment level, not per-operator. Get operators via: ops = [op for op in pipeline.values]
-3. Assignment constructor REQUIRES pipeline_id: Assignment(ops=op_list, cpu=cpu_amount, ram=ram_amount, priority=priority, pool_id=pool_id, pipeline_id=p.pipeline_id)
-4. Pool resources: s.executor.pools[pool_id].avail_cpu_pool, .avail_ram_pool, .max_cpu_pool, .max_ram_pool
-5. Pipeline attributes: p.values (list of operators), p.priority (Priority enum), p.pipeline_id (string ID)
-6. Priority levels: Priority.QUERY (highest), Priority.INTERACTIVE, Priority.BATCH_PIPELINE (lowest)
-7. Failure object: f.ops, f.priority, f.pool_id, f.cpu, f.ram, f.container_id, f.error
-8. Suspend constructor: Suspend(container_id, pool_id)
-9. CRITICAL RESOURCE TRACKING: avail_cpu_pool and avail_ram_pool do NOT update during your scheduling call. If you assign multiple pipelines, you MUST track how much you've already assigned. Example: track "assigned_cpu[pool_id]" and check "avail_cpu - assigned_cpu[pool_id]" for remaining resources.
-10. Do NOT use type hints like List[...] or Tuple[...] - these are not imported. Just use plain Python.
+1. Operator objects do NOT have .cpu or .ram attributes. CPU/RAM are assigned at container level.
+2. Assignment constructor REQUIRES pipeline_id parameter.
+3. CRITICAL: avail_cpu_pool and avail_ram_pool do NOT update during your scheduling call.
+   You MUST track assigned resources yourself if assigning multiple pipelines per tick.
+4. Do NOT use type hints like List[...] or Tuple[...] - these are not imported. Just use plain Python.
+5. Use p.runtime_status().get_ops(ASSIGNABLE_STATES, require_parents_complete=True) to get ready operators.
+
+For latency optimization, remember that the adjusted_latency metric weights priorities:
+- Query jobs have 10x weight (most important for latency)
+- Interactive jobs have 5x weight
+- Batch jobs have 1x weight
+The metric also penalizes incomplete pipelines by dividing by completion rate.
 
 First, briefly reason about your approach inside <reasoning> tags.
 Then, output the complete Python code inside <code> tags.
 
 Example format:
 <reasoning>
-I will improve throughput by prioritizing high-priority jobs and using efficient resource allocation...
+I will improve {metric} by prioritizing high-priority jobs and using efficient resource allocation...
 </reasoning>
 
 <code>
 @register_scheduler_init(key="{policy_key}")
 def init_scheduler(s):
     s.waiting_queue = []
+    s.multi_operator_containers = s.params.get("multi_operator_containers", True)
 
 @register_scheduler(key="{policy_key}")
-def scheduler(s, failures, pipelines):
+def scheduler(s, results, pipelines):
     suspensions = []
     assignments = []
     # Track resources we've assigned this call (avail_* doesn't update during the call)
     assigned_cpu = {{pool_id: 0 for pool_id in range(s.executor.num_pools)}}
     assigned_ram = {{pool_id: 0 for pool_id in range(s.executor.num_pools)}}
 
+    # Handle failures from previous tick (retry with more resources)
+    for r in results:
+        if r.failed():
+            # Could requeue failed operators with increased resources
+            pass
+
     for p in pipelines:
-        ops = [op for op in p.values]
+        # Get operators ready to run
+        op_list = p.runtime_status().get_ops(ASSIGNABLE_STATES, require_parents_complete=True)
+        if not op_list:
+            continue
         for pool_id in range(s.executor.num_pools):
             avail_cpu = s.executor.pools[pool_id].avail_cpu_pool - assigned_cpu[pool_id]
             avail_ram = s.executor.pools[pool_id].avail_ram_pool - assigned_ram[pool_id]
@@ -349,7 +389,7 @@ def scheduler(s, failures, pipelines):
             cpu_to_assign = min(8, avail_cpu)
             ram_to_assign = min(64, avail_ram)
             if cpu_to_assign > 0 and ram_to_assign > 0:
-                assignment = Assignment(ops=ops, cpu=cpu_to_assign, ram=ram_to_assign,
+                assignment = Assignment(ops=op_list, cpu=cpu_to_assign, ram=ram_to_assign,
                                         priority=p.priority, pool_id=pool_id,
                                         pipeline_id=p.pipeline_id)
                 assignments.append(assignment)

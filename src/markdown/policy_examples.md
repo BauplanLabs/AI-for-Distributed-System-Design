@@ -6,62 +6,88 @@ This is a simple FIFO scheduler that assigns one job at a time to each pool crea
 
 ```python
 @register_scheduler_init(key="naive")
-def naive_pipeline_init(s): 
-    s.waiting_queue: Tuple[List[Operator], Priority] = []
+def naive_pipeline_init(s):
+    s.waiting_queue = []
+    s.multi_operator_containers = s.params["multi_operator_containers"]
 
 @register_scheduler(key="naive")
-def naive_pipeline(s, failures: List[Failure], 
-                   pipelines: List[Pipeline]) -> Tuple[List[Suspend], List[Assignment]]:
+def naive_pipeline(s, results, pipelines):
     """
     A naive implementation of a scheduling pipeline which allocates all
     resources of a pool to a single pipeline and handles them in a FIFO order. It
     assigns one job at a time to each pool created.
     Args:
-        failures: List of failed containers from previous tick (ignored in naive implementation)
+        results: List of ExecutionResult from previous tick (ignored in naive implementation)
         pipelines: List of pipelines from WorkloadGenerator
     Returns:
-        Tuple[List[Suspend], List[Assignment]]: 
-            - List of containers to suspend (always empty for naive scheduler)
-            - List of new assignments to provide to Executor
+        Tuple of (suspensions, assignments):
+            - suspensions: List of containers to suspend (always empty for naive scheduler)
+            - assignments: List of new assignments to provide to Executor
     """
-    for p in pipelines:
-        ops = [op for op in p.values]
-        s.waiting_queue.append((ops, p.priority))
-    if len(s.waiting_queue) == 0:
+    # Exit fast if nothing new
+    if len(pipelines) == 0 and len(results) == 0:
         return [], []
+
+    for p in pipelines:
+        s.waiting_queue.append(p)
 
     suspensions = []
     assignments = []
+    requeue_pipelines = []
+
     for pool_id in range(s.executor.num_pools):
         avail_cpu_pool = s.executor.pools[pool_id].avail_cpu_pool
         avail_ram_pool = s.executor.pools[pool_id].avail_ram_pool
-        if avail_cpu_pool > 0 and avail_ram_pool > 0 and s.waiting_queue:
-            op_list, priority = s.waiting_queue.pop(0)
+        if avail_cpu_pool <= 0 or avail_ram_pool <= 0:
+            continue
+
+        while s.waiting_queue:
+            pipeline = s.waiting_queue.pop(0)
+            if pipeline.runtime_status().is_pipeline_successful():
+                continue  # Already done
+
+            requeue_pipelines.append(pipeline)
+
+            # Get operators ready to run
+            if s.multi_operator_containers:
+                op_list = pipeline.runtime_status().get_ops(ASSIGNABLE_STATES, require_parents_complete=False)
+            else:
+                op_list = pipeline.runtime_status().get_ops(ASSIGNABLE_STATES, require_parents_complete=True)[:1]
+            if not op_list:
+                continue
+
             assignment = Assignment(ops=op_list, cpu=avail_cpu_pool, ram=avail_ram_pool,
-                                    priority=priority, pool_id=pool_id)
+                                    priority=pipeline.priority, pool_id=pool_id,
+                                    pipeline_id=pipeline.pipeline_id)
             assignments.append(assignment)
+            break
+
+    s.waiting_queue.extend(requeue_pipelines)
     return suspensions, assignments
 ```
 
 ## A priority scheduler
 
-This scheduler assigns jobs to resources purely in order of priority. This function WILL STARVE low priority jobs. 
+This scheduler assigns jobs to resources purely in order of priority. This function WILL STARVE low priority jobs.
 
 ```python
 @register_scheduler_init(key="priority")
-def init_priority_scheduler(s): 
-    s.qry_jobs: List[WaitingQueueJob]   = [] # high
-    s.interactive_jobs: List[WaitingQueueJob] = [] # medium 
-    s.batch_ppln_jobs: List[WaitingQueueJob]  = [] # low
-
-    s.suspending: Dict[uuid.UUID, WaitingQueueJob] = {}
+def init_priority_scheduler(s):
+    s.multi_operator_containers = s.params["multi_operator_containers"]
+    s.qry_jobs = []      # high priority
+    s.interactive_jobs = []  # medium priority
+    s.batch_ppln_jobs = []   # low priority
+    s.queues_by_prio = {
+        Priority.QUERY: s.qry_jobs,
+        Priority.INTERACTIVE: s.interactive_jobs,
+        Priority.BATCH_PIPELINE: s.batch_ppln_jobs,
+    }
+    s.suspending = {}
     s.oom_failed_to_run = 0
 
 def get_pool_with_max_avail_ram(s, pool_stats):
     id_ = -1
-    max_ram = 0 # must be 0 to ensure we get pool with greatest, nonzero amount of ram
-
-    # pick pool with largest avail RAM and non-zero number of avail CPUs
+    max_ram = 0
     for i in range(s.executor.num_pools):
         if (pool_stats[i]["avail_cpu"] > 0) and (max_ram < pool_stats[i]["avail_ram"]):
             id_ = i
@@ -69,112 +95,90 @@ def get_pool_with_max_avail_ram(s, pool_stats):
     return id_
 
 @register_scheduler(key="priority")
-def priority_scheduler(s, failures: List[Failure],
-                       pipelines: List[Pipeline]) -> Tuple[List[Suspend], List[Assignment]]:
+def priority_scheduler(s, results, pipelines):
     """
-    Assign jobs to resources purely in order of priority. This function WILL
-    STARVE low priority jobs. 
+    Assign jobs to resources purely in order of priority.
+    This function WILL STARVE low priority jobs.
 
     Args:
-        failures: Jobs failed by the executor last tick
+        results: List of ExecutionResult from executor last tick (successes and failures)
         pipelines: Newly generated pipelines arriving
     Returns:
-        Tuple[List[Suspend], List[Assignment]]:
-            - List of containers to suspend (for preemption of lower priority jobs)
-            - List of new assignments to provide to Executor
+        Tuple of (suspensions, assignments):
+            - suspensions: List of containers to suspend (for preemption)
+            - assignments: List of new assignments to provide to Executor
     """
-    # Add new pipelines to appropriate queues
-    for p in pipelines:
-        job = WaitingQueueJob(priority=p.priority, p=p)
-        if p.priority == Priority.QUERY:
-            s.qry_jobs.append(job)
-        elif p.priority == Priority.INTERACTIVE:
-            s.interactive_jobs.append(job)
-        elif p.priority == Priority.BATCH_PIPELINE:
-            s.batch_ppln_jobs.append(job)
+    # Collect all pipelines that need processing
+    pipelines_to_process = {p.pipeline_id: p for p in pipelines}
+    for r in results:
+        for op in r.ops:
+            pipelines_to_process[op.pipeline.pipeline_id] = op.pipeline
 
-    for f in failures:
-        job = WaitingQueueJob(priority=f.priority, p=None, ops=f.ops,
-                              cid=f.cid, pool_id=f.pool_id, old_ram=f.ram, old_cpu=f.cpu,
-                              error=f.error)
-        if f.priority == Priority.QUERY:
-            s.qry_jobs.append(job)
-        elif f.priority == Priority.INTERACTIVE:
-            s.interactive_jobs.append(job)
-        elif f.priority == Priority.BATCH_PIPELINE:
-            s.batch_ppln_jobs.append(job)
+    # Build retry info from failed results
+    retry_info = {}
+    for r in results:
+        if r.failed():
+            for op in r.ops:
+                if op.state() != OperatorState.COMPLETED:
+                    retry_info[op.id] = {
+                        "old_ram": r.ram,
+                        "old_cpu": r.cpu,
+                        "error": r.error,
+                        "container_id": r.container_id,
+                        "pool_id": r.pool_id,
+                    }
 
-    for pool_id in range(s.executor.num_pools):
-        for c in s.executor.pools[pool_id].suspending_containers:
-            job = WaitingQueueJob(priority=c.priority, p=None,
-                                  ops=c.operators, pool_id=pool_id,
-                                  cid=c.cid, old_ram=c.ram, old_cpu=c.cpu,
-                                  error=c.error)
-            # c.cid is UUID type. must use it represented as an int to have
-            # it act as key in python dict
-            s.suspending[c.cid] = job
+    # Queue new work
+    if pipelines_to_process:
+        already_queued = set()
+        for queue in s.queues_by_prio.values():
+            for job in queue:
+                for op in job["ops"]:
+                    already_queued.add(op.id)
 
-    for pool_id in range(s.executor.num_pools):
-        for container in s.executor.pools[pool_id].suspended_containers:
-            if container.cid in s.suspending:
-                job = s.suspending[container.cid]
-                if job.priority == Priority.QUERY:
-                    s.qry_jobs.append(job)
-                elif job.priority == Priority.INTERACTIVE:
-                    s.interactive_jobs.append(job)
-                elif job.priority == Priority.BATCH_PIPELINE:
-                    s.batch_ppln_jobs.append(job)
-                del s.suspending[container.cid]
+        for pipeline in pipelines_to_process.values():
+            if s.multi_operator_containers:
+                op_list = pipeline.runtime_status().get_ops(ASSIGNABLE_STATES, require_parents_complete=False)
+            else:
+                op_list = pipeline.runtime_status().get_ops(ASSIGNABLE_STATES, require_parents_complete=True)
+            op_list = [op for op in op_list if op.id not in already_queued]
+            if len(op_list) == 0:
+                continue
 
+            job = {"priority": pipeline.priority, "pipeline": pipeline, "ops": op_list,
+                   "retry_stats": retry_info.get(op_list[0].id)}
+            s.queues_by_prio[pipeline.priority].append(job)
+
+    # Resource stats per pool
     pool_stats = {}
     for i in range(s.executor.num_pools):
-        # Current available resources to ensure we do not overallocate
-        avail_cpu_pool = s.executor.pools[i].avail_cpu_pool
-        avail_ram_pool = s.executor.pools[i].avail_ram_pool
-        # Maximum pool size to calculate how much to provide
-        total_cpu_pool = s.executor.pools[i].max_cpu_pool
-        total_ram_pool = s.executor.pools[i].max_ram_pool
-
-        # track current resource values for each pool
         pool_stats[i] = {
-                          "avail_cpu": avail_cpu_pool,
-                          "avail_ram": avail_ram_pool, 
-                          "total_cpu": total_cpu_pool,
-                          "total_ram": total_ram_pool, 
-                        }
+            "avail_cpu": s.executor.pools[i].avail_cpu_pool,
+            "avail_ram": s.executor.pools[i].avail_ram_pool,
+            "total_cpu": s.executor.pools[i].max_cpu_pool,
+            "total_ram": s.executor.pools[i].max_ram_pool,
+        }
 
-    # order of these queues is VERY IMPORTANT: must go in order of
-    # DESCENDING priority
+    # Process queues in priority order
     queues = [s.qry_jobs, s.interactive_jobs, s.batch_ppln_jobs]
     new_assignments = []
 
     for queue in queues:
-        # In descending order of priority, and while there are resources
-        # available to allocate, take 10% of available CPU and RAM and allocate
-        # a container for the current job. Jobs are ordered by time of arrival
-        # Must give at minimum 1 GB RAM and 1CPU
         to_remove = []
         to_start = []
         for job in queue:
-            # checking which pool has the most available ram. MUST USE
-            # COPIED STATS as scheduler is placing assignments into pools  
-            # TODO: PARAMATERIZE THIS
             pool_id = get_pool_with_max_avail_ram(s, pool_stats)
-            # all pools depleted
             if pool_id == -1:
                 break
 
             to_remove.append(job)
-            if job.pipeline is not None:
-                op_list = [op for op in job.pipeline.values]
-            else: 
-                op_list = job.ops
+            op_list = job["ops"]
+            rs = job.get("retry_stats")
 
-            # is this job placed in the queue because it previously failed,
-            # i.e. OOM error
-            if job.error is not None:
-                job_cpu = 2*job.old_cpu
-                job_ram = 2*job.old_ram
+            # Handle OOM retry with doubled resources
+            if rs is not None and rs.get("error") is not None:
+                job_cpu = 2 * rs["old_cpu"]
+                job_ram = 2 * rs["old_ram"]
                 if job_cpu > pool_stats[pool_id]["avail_cpu"] or job_ram > pool_stats[pool_id]["avail_ram"]:
                     continue
                 cpu_ratio = job_cpu / pool_stats[pool_id]["total_cpu"]
@@ -182,57 +186,41 @@ def priority_scheduler(s, failures: List[Failure],
                 if cpu_ratio >= 0.5 or ram_ratio >= 0.5:
                     s.oom_failed_to_run += 1
                     continue
-                asgmnt = Assignment(ops=op_list, cpu=job_cpu, ram=job_ram,
-                                    pool_id=pool_id, priority=job.priority)
-                pool_stats[pool_id]["avail_cpu"] -= job_cpu
-                pool_stats[pool_id]["avail_ram"] -= job_ram
-                to_start.append(asgmnt)
-            # If old_cpu is not None, this job was run previously. However,
-            # if it is here, it didn't have an error. Thus it must've been
-            # pre-empted earlier by a higher priority job
-            elif job.old_cpu is not None and (job.old_cpu < pool_stats[pool_id]["avail_cpu"] and
-                                            job.old_ram < pool_stats[pool_id]["avail_ram"]):
-                job_cpu = job.old_cpu
-                job_ram = job.old_ram
-                asgmnt = Assignment(ops=op_list, cpu=job_cpu, ram=job_ram,
-                                    pool_id=pool_id, priority=job.priority)
-                pool_stats[pool_id]["avail_cpu"] -= job_cpu
-                pool_stats[pool_id]["avail_ram"] -= job_ram
-                to_start.append(asgmnt)
-            # The case for newly arrived jobs
+            elif rs is not None:
+                job_cpu = rs["old_cpu"]
+                job_ram = rs["old_ram"]
             else:
-                job_cpu = int(pool_stats[pool_id]["total_cpu"] / 10)
-                job_ram = int(pool_stats[pool_id]["total_ram"] / 10)
+                job_cpu = max(1, int(pool_stats[pool_id]["total_cpu"] / 10))
+                job_ram = max(1, int(pool_stats[pool_id]["total_ram"] / 10))
                 if job_cpu >= pool_stats[pool_id]["avail_cpu"] or job_ram >= pool_stats[pool_id]["avail_ram"]:
                     job_cpu = pool_stats[pool_id]["avail_cpu"]
                     job_ram = pool_stats[pool_id]["avail_ram"]
-                asgmnt = Assignment(ops=op_list, cpu=job_cpu, ram=job_ram,
-                                pool_id=pool_id, priority=job.priority)
-                pool_stats[pool_id]["avail_cpu"] -= job_cpu
-                pool_stats[pool_id]["avail_ram"] -= job_ram
-                to_start.append(asgmnt)
-        for j in to_start:
-            new_assignments.append(j)
+
+            asgmnt = Assignment(ops=op_list, cpu=job_cpu, ram=job_ram,
+                                priority=job["priority"], pool_id=pool_id,
+                                pipeline_id=job["pipeline"].pipeline_id if job["pipeline"] else "unknown")
+            pool_stats[pool_id]["avail_cpu"] -= job_cpu
+            pool_stats[pool_id]["avail_ram"] -= job_ram
+            to_start.append(asgmnt)
+
+        new_assignments.extend(to_start)
         for j in to_remove:
             queue.remove(j)
 
+    # Handle preemption for high priority jobs
     suspensions = []
     if len(s.qry_jobs) > 0:
-        # If there are jobs in high priority queues then check
-        # if any containers are preemptible and make a command to suspend
-        # them. When the resources are free, the first part of this
-        # scheduling algorithm will assign them to appropriate jobs
         num_to_suspend = len(s.qry_jobs)
         cnt = 0
         to_suspend = []
-
         pool_id = 0
         exhausted = [False for _ in range(s.executor.num_pools)]
         iters = [iter(s.executor.pools[i].active_containers) for i in range(s.executor.num_pools)]
+
         while cnt < num_to_suspend:
             if all(exhausted):
                 break
-            try: 
+            try:
                 container = next(iters[pool_id])
                 while container.priority == Priority.QUERY:
                     container = next(iters[pool_id])
@@ -244,12 +232,8 @@ def priority_scheduler(s, failures: List[Failure],
             pool_id = ((pool_id + 1) % s.executor.num_pools)
 
         for sus in to_suspend:
-            susobj = Suspend(sus.cid, sus.pool_id)
-            suspensions.append(susobj)
-    # Print diagnostic information about what assignments are created. This
-    # string is formatted via the Assignment __repr__ function
-    for a in new_assignments:
-        logger.info(a)
+            suspensions.append(Suspend(sus.container_id, sus.pool_id))
+
     return suspensions, new_assignments
 ```
 
@@ -258,193 +242,140 @@ def priority_scheduler(s, failures: List[Failure],
 This scheduler assigns jobs to resources based on their priority and the available resources in each pool, i.e. interactive/query jobs go to one pool, batch jobs to another.
 
 ```python
-from typing import List, Tuple, Dict
-import uuid
-import logging
-from eudoxia.workload import Pipeline, Operator
-from eudoxia.executor.assignment import Assignment, Failure, Suspend
-from eudoxia.utils import Priority
-from .decorators import register_scheduler_init, register_scheduler
-from .waiting_queue import WaitingQueueJob
-
-logger = logging.getLogger(__name__)
-
-
 @register_scheduler_init(key="priority-pool")
 def init_priority_pool_scheduler(s):
-    s.qry_jobs: List[WaitingQueueJob]   = [] # high
-    s.interactive_jobs: List[WaitingQueueJob] = [] # medium 
-    s.batch_ppln_jobs: List[WaitingQueueJob]  = [] # low
-    
-    s.suspending: Dict[uuid.UUID, WaitingQueueJob] = {}
+    s.multi_operator_containers = s.params["multi_operator_containers"]
+    s.qry_jobs = []      # high priority
+    s.interactive_jobs = []  # medium priority
+    s.batch_ppln_jobs = []   # low priority
+    s.queues_by_prio = {
+        Priority.QUERY: s.qry_jobs,
+        Priority.INTERACTIVE: s.interactive_jobs,
+        Priority.BATCH_PIPELINE: s.batch_ppln_jobs,
+    }
+    s.suspending = {}
     assert s.executor.num_pools == 2, "Priority-by-pool scheduler requires 2 pools"
     s.oom_failed_to_run = 0
 
 @register_scheduler(key="priority-pool")
-def priority_pool_scheduler(s, failures: List[Failure],
-                       pipelines: List[Pipeline]) -> Tuple[List[Suspend], List[Assignment]]:
+def priority_pool_scheduler(s, results, pipelines):
     """
     Scheduler that assigns jobs to dedicated pools based on priority.
-    Interactive/query jobs go to one pool, batch jobs to another.
+    Interactive/query jobs go to pool 0, batch jobs to pool 1.
     This scheduler doesn't perform preemption/suspension.
-    
+
     Args:
-        failures: Jobs failed by the executor last tick
+        results: List of ExecutionResult from executor last tick
         pipelines: Newly generated pipelines arriving
     Returns:
-        Tuple[List[Suspend], List[Assignment]]:
-            - List of containers to suspend (always empty for this scheduler)
-            - List of new assignments to provide to Executor
+        Tuple of (suspensions, assignments):
+            - suspensions: List of containers to suspend (always empty for this scheduler)
+            - assignments: List of new assignments to provide to Executor
     """
-    # Add new pipelines to appropriate queues
-    for p in pipelines:
-        job = WaitingQueueJob(priority=p.priority, p=p)
-        if p.priority == Priority.QUERY:
-            s.qry_jobs.append(job)
-        elif p.priority == Priority.INTERACTIVE:
-            s.interactive_jobs.append(job)
-        elif p.priority == Priority.BATCH_PIPELINE:
-            s.batch_ppln_jobs.append(job)
+    # Collect all pipelines that need processing
+    pipelines_to_process = {p.pipeline_id: p for p in pipelines}
+    for r in results:
+        for op in r.ops:
+            pipelines_to_process[op.pipeline.pipeline_id] = op.pipeline
 
-    for f in failures:
-        job = WaitingQueueJob(priority=f.priority, p=None, ops=f.ops,
-                              cid=f.cid, pool_id=f.pool_id, old_ram=f.ram, old_cpu=f.cpu,
-                              error=f.error)
-        if f.priority == Priority.QUERY:
-            s.qry_jobs.append(job)
-        elif f.priority == Priority.INTERACTIVE:
-            s.interactive_jobs.append(job)
-        elif f.priority == Priority.BATCH_PIPELINE:
-            s.batch_ppln_jobs.append(job)
+    # Build retry info from failed results
+    retry_info = {}
+    for r in results:
+        if r.failed():
+            for op in r.ops:
+                if op.state() != OperatorState.COMPLETED:
+                    retry_info[op.id] = {
+                        "old_ram": r.ram,
+                        "old_cpu": r.cpu,
+                        "error": r.error,
+                        "container_id": r.container_id,
+                        "pool_id": r.pool_id,
+                    }
 
-    for pool_id in range(s.executor.num_pools):
-        for c in s.executor.pools[pool_id].suspending_containers:
-            job = WaitingQueueJob(priority=c.priority, p=None,
-                                  ops=c.operators, pool_id=pool_id,
-                                  cid=c.cid, old_ram=c.ram, old_cpu=c.cpu,
-                                  error=c.error)
-            # c.cid is UUID type. must use it represented as an int to have
-            # it act as key in python dict
-            s.suspending[c.cid] = job
+    # Queue new work
+    if pipelines_to_process:
+        already_queued = set()
+        for queue in s.queues_by_prio.values():
+            for job in queue:
+                for op in job["ops"]:
+                    already_queued.add(op.id)
 
-    for pool_id in range(s.executor.num_pools):
-        for container in s.executor.pools[pool_id].suspended_containers:
-            if container.cid in s.suspending:
-                job = s.suspending[container.cid]
-                if job.priority == Priority.QUERY:
-                    s.qry_jobs.append(job)
-                elif job.priority == Priority.INTERACTIVE:
-                    s.interactive_jobs.append(job)
-                elif job.priority == Priority.BATCH_PIPELINE:
-                    s.batch_ppln_jobs.append(job)
-                del s.suspending[container.cid]
+        for pipeline in pipelines_to_process.values():
+            if s.multi_operator_containers:
+                op_list = pipeline.runtime_status().get_ops(ASSIGNABLE_STATES, require_parents_complete=False)
+            else:
+                op_list = pipeline.runtime_status().get_ops(ASSIGNABLE_STATES, require_parents_complete=True)
+            op_list = [op for op in op_list if op.id not in already_queued]
+            if len(op_list) == 0:
+                continue
 
+            job = {"priority": pipeline.priority, "pipeline": pipeline, "ops": op_list,
+                   "retry_stats": retry_info.get(op_list[0].id)}
+            s.queues_by_prio[pipeline.priority].append(job)
+
+    # Resource stats per pool
     pool_stats = {}
     for i in range(s.executor.num_pools):
-        # Current available resources to ensure we do not overallocate
-        avail_cpu_pool = s.executor.pools[i].avail_cpu_pool
-        avail_ram_pool = s.executor.pools[i].avail_ram_pool
-        # Maximum pool size to calculate how much to provide
-        total_cpu_pool = s.executor.pools[i].max_cpu_pool
-        total_ram_pool = s.executor.pools[i].max_ram_pool
-
-        # track current resource values for each pool
         pool_stats[i] = {
-                          "avail_cpu": avail_cpu_pool,
-                          "avail_ram": avail_ram_pool, 
-                          "total_cpu": total_cpu_pool,
-                          "total_ram": total_ram_pool, 
-                        }
+            "avail_cpu": s.executor.pools[i].avail_cpu_pool,
+            "avail_ram": s.executor.pools[i].avail_ram_pool,
+            "total_cpu": s.executor.pools[i].max_cpu_pool,
+            "total_ram": s.executor.pools[i].max_ram_pool,
+        }
 
-    # Defines what priorirty levels are assigned to which pools
-    pool_queues = {0: [s.qry_jobs, s.interactive_jobs], 
+    # Pool 0: query + interactive, Pool 1: batch
+    pool_queues = {0: [s.qry_jobs, s.interactive_jobs],
                    1: [s.batch_ppln_jobs]}
     new_assignments = []
 
-    for pool_id in range(s.executor.num_pools): 
+    for pool_id in range(s.executor.num_pools):
         queues = pool_queues[pool_id]
         for queue in queues:
-            # In descending order of priority, and while there are resources
-            # available to allocate, take 10% of available CPU and RAM and allocate
-            # a container for the current job. Jobs are ordered by time of arrival
-            # Must give at minimum 1 GB RAM and 1CPU
             to_remove = []
             to_start = []
             for job in queue:
-                avail_ram = pool_stats[pool_id]["avail_ram"] 
-                avail_cpu = pool_stats[pool_id]["avail_cpu"] 
+                avail_ram = pool_stats[pool_id]["avail_ram"]
+                avail_cpu = pool_stats[pool_id]["avail_cpu"]
 
-                # the pool is depleted so we shouldnt make any allocations
                 if avail_ram == 0 or avail_cpu == 0:
-                    assert avail_ram == 0 and avail_cpu == 0, f"Avail RAM: {avail_ram}, CPU: {avail_cpu} invalid pool {pool_id}"
                     break
-                
-                logger.info(pool_stats[pool_id])
+
                 to_remove.append(job)
-                if job.pipeline is not None:
-                    op_list = [op for op in job.pipeline.values]
-                else: 
-                    op_list = job.ops
+                op_list = job["ops"]
+                rs = job.get("retry_stats")
 
-
-                # i.e. OOM error
-                if job.error is not None:
-                    logger.info("OOM")
-                    job_cpu = 2*job.old_cpu
-                    job_ram = 2*job.old_ram
+                # Handle OOM retry
+                if rs is not None and rs.get("error") is not None:
+                    job_cpu = 2 * rs["old_cpu"]
+                    job_ram = 2 * rs["old_ram"]
                     cpu_ratio = job_cpu / pool_stats[pool_id]["total_cpu"]
                     ram_ratio = job_ram / pool_stats[pool_id]["total_ram"]
                     if cpu_ratio >= 0.5 or ram_ratio >= 0.5:
                         s.oom_failed_to_run += 1
                         continue
-
-                    if job_cpu >= pool_stats[pool_id]["avail_cpu"] or job_ram >= pool_stats[pool_id]["avail_ram"]:
-                        job_cpu = pool_stats[pool_id]["avail_cpu"]
-                        job_ram = pool_stats[pool_id]["avail_ram"]
-                    asgmnt = Assignment(ops=op_list, cpu=job_cpu, ram=job_ram,
-                                        pool_id=pool_id, priority=job.priority)
-                    pool_stats[pool_id]["avail_cpu"] -= job_cpu
-                    pool_stats[pool_id]["avail_ram"] -= job_ram
-                    to_start.append(asgmnt)
-                # If old_cpu is not None, this job was run previously. However,
-                # if it is here, it didn't have an error. Thus it must've been
-                # pre-empted earlier by a higher priority job
-                elif job.old_cpu is not None and (job.old_cpu <= pool_stats[pool_id]["avail_cpu"] and
-                                                job.old_ram <= pool_stats[pool_id]["avail_ram"]):
-                    logger.info("PREEMPT")
-                    job_cpu = job.old_cpu
-                    job_ram = job.old_ram
-                    # can be == instead of >= as we checked <= in elif 
-                    if job_cpu == pool_stats[pool_id]["avail_cpu"] or job_ram == pool_stats[pool_id]["avail_ram"]:
-                        job_cpu = pool_stats[pool_id]["avail_cpu"]
-                        job_ram = pool_stats[pool_id]["avail_ram"]
-                    asgmnt = Assignment(ops=op_list, cpu=job_cpu, ram=job_ram,
-                                        pool_id=pool_id, priority=job.priority)
-                    pool_stats[pool_id]["avail_cpu"] -= job_cpu
-                    pool_stats[pool_id]["avail_ram"] -= job_ram
-                    to_start.append(asgmnt)
-                # The case for newly arrived jobs
+                    if job_cpu >= avail_cpu or job_ram >= avail_ram:
+                        job_cpu = avail_cpu
+                        job_ram = avail_ram
+                elif rs is not None and (rs["old_cpu"] <= avail_cpu and rs["old_ram"] <= avail_ram):
+                    job_cpu = rs["old_cpu"]
+                    job_ram = rs["old_ram"]
                 else:
-                    logger.info("NEW")
-                    job_cpu = int(pool_stats[pool_id]["total_cpu"] / 10)
-                    job_ram = int(pool_stats[pool_id]["total_ram"] / 10)
-                    if job_cpu >= pool_stats[pool_id]["avail_cpu"] or job_ram >= pool_stats[pool_id]["avail_ram"]:
-                        job_cpu = pool_stats[pool_id]["avail_cpu"]
-                        job_ram = pool_stats[pool_id]["avail_ram"]
-                    asgmnt = Assignment(ops=op_list, cpu=job_cpu, ram=job_ram,
-                                    pool_id=pool_id, priority=job.priority)
-                    pool_stats[pool_id]["avail_cpu"] -= job_cpu
-                    pool_stats[pool_id]["avail_ram"] -= job_ram
-                    to_start.append(asgmnt)
-            for j in to_start:
-                new_assignments.append(j)
+                    job_cpu = max(1, int(pool_stats[pool_id]["total_cpu"] / 10))
+                    job_ram = max(1, int(pool_stats[pool_id]["total_ram"] / 10))
+                    if job_cpu >= avail_cpu or job_ram >= avail_ram:
+                        job_cpu = avail_cpu
+                        job_ram = avail_ram
+
+                asgmnt = Assignment(ops=op_list, cpu=job_cpu, ram=job_ram,
+                                    priority=job["priority"], pool_id=pool_id,
+                                    pipeline_id=job["pipeline"].pipeline_id if job["pipeline"] else "unknown")
+                pool_stats[pool_id]["avail_cpu"] -= job_cpu
+                pool_stats[pool_id]["avail_ram"] -= job_ram
+                to_start.append(asgmnt)
+
+            new_assignments.extend(to_start)
             for j in to_remove:
                 queue.remove(j)
 
-    suspensions = []
-    # Print diagnostic information about what assignments are created. This
-    # string is formatted via the Assignment __repr__ function
-    for a in new_assignments:
-        logger.info(a)
-    return suspensions, new_assignments
+    return [], new_assignments  # No suspensions for this scheduler
 ```
