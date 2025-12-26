@@ -88,11 +88,23 @@ def generate_trace_file(params, output_file):
 
 @timing
 def run_simulation_with_trace(params, trace_file):
-    """Run simulation using a trace file"""
+    """Run simulation using a trace file.
+
+    Returns None if no containers complete (which causes percentile calculation to fail).
+    """
     with open(trace_file) as f:
         reader = CSVWorkloadReader(f)
         workload = reader.get_workload(params["ticks_per_second"])
-        return run_simulator(params, workload=workload)
+        try:
+            return run_simulator(params, workload=workload)
+        except IndexError as e:
+            # This happens when no containers complete (empty container_tick_times)
+            import logging
+
+            logging.getLogger(__name__).warning(
+                f"No containers completed in {trace_file}, skipping: {e}"
+            )
+            return None
 
 
 @timing
@@ -127,12 +139,16 @@ def get_raw_stats_for_policy(
         policy_algorithm: Policy key to test
 
     Returns:
-        List of SimulatorStats objects (one per trace file)
+        List of SimulatorStats objects (one per trace file, filtering out failed simulations)
     """
     params = base_params.copy()
     params["scheduler_algo"] = policy_algorithm
     # Run sequentially in this process to preserve scheduler registrations from exec()
-    stats = [run_simulation_with_trace(params, trace_file) for trace_file in trace_files]
+    all_stats = [
+        run_simulation_with_trace(params, trace_file) for trace_file in trace_files
+    ]
+    # Filter out None results (from simulations where no containers completed)
+    stats = [s for s in all_stats if s is not None]
     return stats
 
 

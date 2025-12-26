@@ -151,7 +151,7 @@ def generate_policy_with_llm(
         reasoning_effort = "high"
         temperature = 1
 
-    print(f"sending {len(messages)} messages to {model}")
+    print(f"Now sending {len(messages)} messages as context to {model}...")
     response = completion_with_retry(
         model=model,
         messages=messages,
@@ -195,7 +195,9 @@ def generate_and_save_policy(
     # start at the init, stripping the prior imports (because we instruct the LLM not to import anything else)
     #
     # TODO: why not just let it import what it needs, and run the generated .py as its own process?
-    starter_template = SCHEDULER_TEMPLATE[SCHEDULER_TEMPLATE.index("@register_scheduler_init"):]
+    starter_template = SCHEDULER_TEMPLATE[
+        SCHEDULER_TEMPLATE.index("@register_scheduler_init") :
+    ]
     starter_template = starter_template.format(scheduler_name="example")
     system_context = build_system_context(
         files=["eudoxia_bauplan.md"],

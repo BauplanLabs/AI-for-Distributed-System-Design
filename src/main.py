@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 import statistics
 
 # eudoxia-specific imports
-from typing import List, Tuple  # noqa: F401
 from eudoxia.workload import Pipeline, OperatorState  # noqa: F401
 from eudoxia.workload.runtime_status import ASSIGNABLE_STATES  # noqa: F401
 from eudoxia.executor.assignment import Assignment, ExecutionResult, Suspend  # noqa: F401
@@ -18,7 +17,7 @@ from eudoxia.simulator import get_param_defaults  # noqa: F401
 from simulation_utils import (
     generate_traces,
     get_raw_stats_for_policy,
-    get_stats_for_policy,
+    extract_metrics_from_stats,
 )
 
 # import prompts
@@ -161,7 +160,7 @@ def main(
     print("\nRunning baseline policies...")
     print("First, running 'naive' policy...")
     naive_raw_stats = get_raw_stats_for_policy(base_params, trace_files, "naive")
-    naive_stats = get_stats_for_policy(naive_raw_stats, metric)
+    naive_stats = extract_metrics_from_stats(naive_raw_stats, metric)
     baseline_median_metric = statistics.median(naive_stats)
     print_policy_stats("naive", naive_stats, prefix="Baseline", metric=metric)
     print("\n" + "=" * 60)
@@ -234,7 +233,7 @@ def main(
             policy_raw_stats = get_raw_stats_for_policy(
                 base_params, trace_files, policy_key
             )
-            policy_stats = get_stats_for_policy(policy_raw_stats, metric)
+            policy_stats = extract_metrics_from_stats(policy_raw_stats, metric)
             median_metric = statistics.median(policy_stats)
 
             print_policy_stats(policy_key, policy_stats, metric=metric)
