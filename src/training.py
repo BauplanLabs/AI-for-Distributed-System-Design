@@ -33,8 +33,9 @@ from tinker.types.tensor_data import TensorData
 # eudoxia imports for simulation
 from eudoxia.simulator import get_param_defaults
 from eudoxia.scheduler import register_scheduler_init, register_scheduler  # noqa: F401
-from eudoxia.executor import Failure, Suspend, Assignment  # noqa: F401
-from eudoxia.workload import WorkloadGenerator, Pipeline, Operator  # noqa: F401
+from eudoxia.executor import ExecutionResult, Suspend, Assignment  # noqa: F401
+from eudoxia.workload import WorkloadGenerator, Pipeline, Operator, OperatorState  # noqa: F401
+from eudoxia.workload.runtime_status import ASSIGNABLE_STATES  # noqa: F401
 from eudoxia.utils import Priority  # noqa: F401
 
 # local imports
@@ -219,12 +220,12 @@ class Config:
     # tinker://89dfc3d1-4932-5270-bd0f-4245fcb628df:train:0/weights/step_000010
     checkpoint: str | None = None
     # Simulation parameters
-    metric: str = "throughput"  # "throughput" or "latency"
+    metric: str = "latency"  # "latency" or "throughput"
     duration: int = 60
     ticks_per_second: int = 1000
     num_pools: int = 1
-    cpu_pool: int = 64
-    ram_pool: int = 500
+    cpus_per_pool: int = 64
+    ram_gb_per_pool: int = 500
     num_operators: int = 8  # Default operators per pipeline
     traces_per_config: int = 2  # With 23 configs, generates 46 traces by default
     trace_configs: list[dict] = chz.field(default_factory=_default_trace_configs)
@@ -236,8 +237,8 @@ def get_base_params(config: Config) -> dict:
     base_params["duration"] = config.duration
     base_params["ticks_per_second"] = config.ticks_per_second
     base_params["num_pools"] = config.num_pools
-    base_params["cpu_pool"] = config.cpu_pool
-    base_params["ram_pool"] = config.ram_pool
+    base_params["cpus_per_pool"] = config.cpus_per_pool
+    base_params["ram_gb_per_pool"] = config.ram_gb_per_pool
     base_params["num_operators"] = config.num_operators
     base_params["interactive_prob"] = 0.3
     base_params["query_prob"] = 0.1
@@ -254,7 +255,7 @@ def generate_training_traces(config: Config) -> list[str]:
     - num_pipelines, waiting_seconds_mean (workload intensity)
     - num_operators (complexity)
     - interactive_prob, query_prob, batch_prob (priority mix)
-    - cpu_pool, ram_pool (resource constraints)
+    - cpus_per_pool, ram_gb_per_pool (resource constraints)
     """
     base_params = get_base_params(config)
     trace_files = []
@@ -263,6 +264,11 @@ def generate_training_traces(config: Config) -> list[str]:
         batch_params = base_params.copy()
 
         # Apply all parameters from the trace config
+        # Map old param names to new ones for backward compatibility
+        param_mapping = {
+            "cpu_pool": "cpus_per_pool",
+            "ram_pool": "ram_gb_per_pool",
+        }
         param_keys = [
             "num_pipelines",
             "waiting_seconds_mean",
@@ -270,12 +276,16 @@ def generate_training_traces(config: Config) -> list[str]:
             "interactive_prob",
             "query_prob",
             "batch_prob",
-            "cpu_pool",
-            "ram_pool",
+            "cpus_per_pool",
+            "ram_gb_per_pool",
         ]
         for key in param_keys:
             if key in trace_config:
                 batch_params[key] = trace_config[key]
+        # Handle old param names from trace_configs
+        for old_key, new_key in param_mapping.items():
+            if old_key in trace_config:
+                batch_params[new_key] = trace_config[old_key]
 
         # Create descriptive file name prefix
         config_label = trace_config.get("config_label", f"config_{idx}")
@@ -307,41 +317,86 @@ priority-based scheduling, resource allocation strategies, and intelligent queue
 IMPORTANT: Use the following EXACT key in both @register_scheduler_init and @register_scheduler decorators: "{policy_key}"
 Do NOT generate your own key - you MUST use exactly: "{policy_key}"
 
+SCHEDULER FUNCTION SIGNATURE (MUST USE THIS EXACT SIGNATURE):
+def scheduler(s, results, pipelines):
+    '''
+    Args:
+        s: Scheduler state object (has s.executor, s.params, and any state you set in init)
+        results: List[ExecutionResult] - execution results from previous tick (successes AND failures)
+        pipelines: List[Pipeline] - newly arrived pipelines
+    Returns:
+        Tuple of (suspensions, assignments) where:
+        - suspensions: list of Suspend objects
+        - assignments: list of Assignment objects
+    '''
+
+KEY API REFERENCE:
+- ExecutionResult: r.ops, r.priority, r.pool_id, r.cpu, r.ram, r.container_id, r.error, r.failed()
+  - Use r.failed() to check if it's a failure (returns True if r.error is not None)
+  - Contains both successes and failures - filter with r.failed() as needed
+  - IMPORTANT: ExecutionResult does NOT have pipeline_id. To get pipeline: r.ops[0].pipeline
+- Operator: op.pipeline (the Pipeline this operator belongs to), op.id, op.state()
+  - WARNING: Operators do NOT have .cpu or .ram attributes! These are container-level, not operator-level.
+- Assignment: Assignment(ops=op_list, cpu=cpu_amount, ram=ram_amount, priority=priority, pool_id=pool_id, pipeline_id=pipeline.pipeline_id)
+- Suspend: Suspend(container_id, pool_id)
+- Pipeline: p.values (DAG of operators), p.priority (Priority enum), p.pipeline_id (string ID)
+- Pipeline runtime: p.runtime_status().get_ops(ASSIGNABLE_STATES, require_parents_complete=True/False)
+- Pipeline completion: p.runtime_status().is_pipeline_successful()
+- OperatorState: PENDING, ASSIGNED, RUNNING, SUSPENDING, COMPLETED, FAILED
+- ASSIGNABLE_STATES: states that can transition to ASSIGNED (PENDING, FAILED)
+- Pool resources: s.executor.pools[pool_id].avail_cpu_pool, .avail_ram_pool, .max_cpu_pool, .max_ram_pool
+- Priority levels: Priority.QUERY (highest), Priority.INTERACTIVE, Priority.BATCH_PIPELINE (lowest)
+
 COMMON MISTAKES TO AVOID:
-1. Operator objects do NOT have .cpu or .ram attributes. Do not try to access op.cpu or op.ram.
-2. CPU and RAM are allocated at the Assignment level, not per-operator. Get operators via: ops = [op for op in pipeline.values]
-3. Assignment constructor REQUIRES pipeline_id: Assignment(ops=op_list, cpu=cpu_amount, ram=ram_amount, priority=priority, pool_id=pool_id, pipeline_id=p.pipeline_id)
-4. Pool resources: s.executor.pools[pool_id].avail_cpu_pool, .avail_ram_pool, .max_cpu_pool, .max_ram_pool
-5. Pipeline attributes: p.values (list of operators), p.priority (Priority enum), p.pipeline_id (string ID)
-6. Priority levels: Priority.QUERY (highest), Priority.INTERACTIVE, Priority.BATCH_PIPELINE (lowest)
-7. Failure object: f.ops, f.priority, f.pool_id, f.cpu, f.ram, f.container_id, f.error
-8. Suspend constructor: Suspend(container_id, pool_id)
-9. CRITICAL RESOURCE TRACKING: avail_cpu_pool and avail_ram_pool do NOT update during your scheduling call. If you assign multiple pipelines, you MUST track how much you've already assigned. Example: track "assigned_cpu[pool_id]" and check "avail_cpu - assigned_cpu[pool_id]" for remaining resources.
-10. Do NOT use type hints like List[...] or Tuple[...] - these are not imported. Just use plain Python.
+1. Operator objects do NOT have .cpu or .ram attributes. Use fixed values like cpu=8, ram=64 instead.
+   WRONG: cpu = op.cpu  # ERROR - op.cpu doesn't exist!
+   RIGHT: cpu = 8  # Use fixed reasonable values
+2. Assignment constructor REQUIRES pipeline_id parameter.
+3. CRITICAL: avail_cpu_pool and avail_ram_pool do NOT update during your scheduling call.
+   You MUST track assigned resources yourself if assigning multiple pipelines per tick.
+4. Do NOT use type hints like List[...] or Tuple[...] - these are not imported. Just use plain Python.
+5. Use p.runtime_status().get_ops(ASSIGNABLE_STATES, require_parents_complete=True) to get ready operators.
+6. ExecutionResult does NOT have pipeline_id. Get pipeline via: r.ops[0].pipeline.pipeline_id
+
+For latency optimization, remember that the adjusted_latency metric weights priorities:
+- Query jobs have 10x weight (most important for latency)
+- Interactive jobs have 5x weight
+- Batch jobs have 1x weight
+The metric also penalizes incomplete pipelines by dividing by completion rate.
 
 First, briefly reason about your approach inside <reasoning> tags.
 Then, output the complete Python code inside <code> tags.
 
 Example format:
 <reasoning>
-I will improve throughput by prioritizing high-priority jobs and using efficient resource allocation...
+I will improve {metric} by prioritizing high-priority jobs and using efficient resource allocation...
 </reasoning>
 
 <code>
 @register_scheduler_init(key="{policy_key}")
 def init_scheduler(s):
     s.waiting_queue = []
+    s.multi_operator_containers = s.params.get("multi_operator_containers", True)
 
 @register_scheduler(key="{policy_key}")
-def scheduler(s, failures, pipelines):
+def scheduler(s, results, pipelines):
     suspensions = []
     assignments = []
     # Track resources we've assigned this call (avail_* doesn't update during the call)
     assigned_cpu = {{pool_id: 0 for pool_id in range(s.executor.num_pools)}}
     assigned_ram = {{pool_id: 0 for pool_id in range(s.executor.num_pools)}}
 
+    # Handle failures from previous tick (retry with more resources)
+    for r in results:
+        if r.failed():
+            # Could requeue failed operators with increased resources
+            pass
+
     for p in pipelines:
-        ops = [op for op in p.values]
+        # Get operators ready to run
+        op_list = p.runtime_status().get_ops(ASSIGNABLE_STATES, require_parents_complete=True)
+        if not op_list:
+            continue
         for pool_id in range(s.executor.num_pools):
             avail_cpu = s.executor.pools[pool_id].avail_cpu_pool - assigned_cpu[pool_id]
             avail_ram = s.executor.pools[pool_id].avail_ram_pool - assigned_ram[pool_id]
@@ -349,7 +404,7 @@ def scheduler(s, failures, pipelines):
             cpu_to_assign = min(8, avail_cpu)
             ram_to_assign = min(64, avail_ram)
             if cpu_to_assign > 0 and ram_to_assign > 0:
-                assignment = Assignment(ops=ops, cpu=cpu_to_assign, ram=ram_to_assign,
+                assignment = Assignment(ops=op_list, cpu=cpu_to_assign, ram=ram_to_assign,
                                         priority=p.priority, pool_id=pool_id,
                                         pipeline_id=p.pipeline_id)
                 assignments.append(assignment)
@@ -511,8 +566,10 @@ def main(config: Config):
     # Create training client (from checkpoint or fresh)
     if config.checkpoint:
         logger.info(f"Resuming from checkpoint: {config.checkpoint}")
-        training_client = service_client.create_training_client_from_state_with_optimizer(
-            path=config.checkpoint,
+        training_client = (
+            service_client.create_training_client_from_state_with_optimizer(
+                path=config.checkpoint,
+            )
         )
         job_id = extract_job_id(config.checkpoint)
         start_step = extract_step_from_checkpoint(config.checkpoint) + 1
@@ -532,6 +589,8 @@ def main(config: Config):
 
     job_log_path = Path(config.log_path) / job_id
     job_log_path.mkdir(parents=True, exist_ok=True)
+    policies_path = job_log_path / "policies"
+    policies_path.mkdir(parents=True, exist_ok=True)
     logger.info(f"Saving logs to: {job_log_path}")
 
     # Get tokenizer
@@ -633,8 +692,12 @@ def main(config: Config):
                     sample_key = f"rl_policy_{job_id[:8]}_{policy_counter}"
 
                     # Build prompt with this sample's unique key
-                    prompt_text = build_prompt(sample_key, config.metric, system_context)
-                    prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=True)
+                    prompt_text = build_prompt(
+                        sample_key, config.metric, system_context
+                    )
+                    prompt_tokens = tokenizer.encode(
+                        prompt_text, add_special_tokens=True
+                    )
                     model_input = types.ModelInput.from_ints(tokens=prompt_tokens)
 
                     sample_future = sampling_client.sample(
@@ -696,16 +759,19 @@ def main(config: Config):
 
                     # Store first sample for logging
                     if sample_idx == 0:
+                        # Save policy code to file
+                        policy_file = None
+                        if policy_code is not None:
+                            policy_file = f"{sample_key}.py"
+                            policy_file_path = policies_path / policy_file
+                            with open(policy_file_path, "w") as f:
+                                f.write(policy_code)
+
                         batch_samples.append(
                             {
                                 "step": global_step,
                                 "policy_key": sample_key,
-                                "raw_response": generated_text[
-                                    :2000
-                                ],  # Truncate for logging
-                                "policy_code": policy_code[:2000]
-                                if policy_code
-                                else None,
+                                "policy_file": policy_file,
                                 "reward": reward,
                                 "metric_values": metric_values,
                                 "error": error_msg,

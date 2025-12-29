@@ -209,6 +209,7 @@ __marimo__/
 *.csv
 
 eudoxia/
+eudoxia_repo/
 policies/
 
 training_logs/

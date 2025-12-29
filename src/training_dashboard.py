@@ -11,7 +11,6 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 
 # Paths to log files
 LOG_DIR = Path(__file__).parent / "training_logs"
@@ -99,20 +98,26 @@ def compute_metrics_from_policies(policies: list[dict]) -> pd.DataFrame:
 
     metrics = []
     for i, p in enumerate(policies):
-        metrics.append({
-            "step": p.get("step", i),
-            "reward": p.get("reward", 0.0),
-            "valid": p.get("valid", False),
-            "has_error": p.get("error") is not None,
-        })
+        metrics.append(
+            {
+                "step": p.get("step", i),
+                "reward": p.get("reward", 0.0),
+                "valid": p.get("valid", False),
+                "has_error": p.get("error") is not None,
+            }
+        )
 
     df = pd.DataFrame(metrics)
 
     # Compute rolling stats if we have enough data
     if len(df) > 1:
         window = min(5, len(df))
-        df["reward_rolling_avg"] = df["reward"].rolling(window=window, min_periods=1).mean()
-        df["valid_rate_rolling"] = df["valid"].rolling(window=window, min_periods=1).mean()
+        df["reward_rolling_avg"] = (
+            df["reward"].rolling(window=window, min_periods=1).mean()
+        )
+        df["valid_rate_rolling"] = (
+            df["valid"].rolling(window=window, min_periods=1).mean()
+        )
 
     return df
 
@@ -130,7 +135,9 @@ def main():
     available_jobs = get_available_jobs()
 
     # Create tabs
-    tab1, tab2, tab3 = st.tabs(["📊 Training Progress", "🔍 Policy Explorer", "📁 Saved Policies"])
+    tab1, tab2, tab3 = st.tabs(
+        ["📊 Training Progress", "🔍 Policy Explorer", "📁 Saved Policies"]
+    )
 
     if not available_jobs:
         with tab1:
@@ -167,12 +174,18 @@ def main():
             st.sidebar.subheader("Job Details")
             st.sidebar.markdown(f"**Model:** `{job_info.get('model_name', 'N/A')}`")
             st.sidebar.markdown(f"**Metric:** {job_info.get('metric', 'N/A')}")
-            st.sidebar.markdown(f"**Baseline:** {job_info.get('baseline_metric', 'N/A'):.2f}" if job_info.get('baseline_metric') else "**Baseline:** N/A")
+            st.sidebar.markdown(
+                f"**Baseline:** {job_info.get('baseline_metric', 'N/A'):.2f}"
+                if job_info.get("baseline_metric")
+                else "**Baseline:** N/A"
+            )
             st.sidebar.markdown(f"**Num Traces:** {job_info.get('num_traces', 'N/A')}")
             st.sidebar.markdown(f"**Batch Size:** {job_info.get('batch_size', 'N/A')}")
             st.sidebar.markdown(f"**Group Size:** {job_info.get('group_size', 'N/A')}")
             st.sidebar.markdown(f"**Epochs:** {job_info.get('num_epochs', 'N/A')}")
-            st.sidebar.markdown(f"**Learning Rate:** {job_info.get('learning_rate', 'N/A')}")
+            st.sidebar.markdown(
+                f"**Learning Rate:** {job_info.get('learning_rate', 'N/A')}"
+            )
             st.sidebar.markdown(f"**LoRA Rank:** {job_info.get('lora_rank', 'N/A')}")
 
             if job_info.get("final_checkpoint"):
@@ -228,7 +241,10 @@ def main():
                             x="step",
                             y="valid_rate_rolling",
                             title="Policy Validity Rate (Rolling Avg)",
-                            labels={"step": "Training Step", "valid_rate_rolling": "Valid Rate"},
+                            labels={
+                                "step": "Training Step",
+                                "valid_rate_rolling": "Valid Rate",
+                            },
                         )
                         fig_valid.update_traces(line=dict(color="#00CC96", width=2))
                         fig_valid.update_layout(yaxis_tickformat=".0%")
@@ -270,12 +286,15 @@ def main():
                     st.metric(
                         "Avg Reward (valid)",
                         f"{sum(p['reward'] for p in rewarded) / len(rewarded):.3f}"
-                        if rewarded else "N/A",
+                        if rewarded
+                        else "N/A",
                     )
 
                 # Reward distribution
                 st.subheader("Reward Distribution")
-                valid_rewards = [p.get("reward", 0) for p in policies if p.get("valid", False)]
+                valid_rewards = [
+                    p.get("reward", 0) for p in policies if p.get("valid", False)
+                ]
                 if valid_rewards:
                     fig_hist = px.histogram(
                         x=valid_rewards,
@@ -299,10 +318,14 @@ def main():
                         err_key = err[:80] if len(err) > 80 else err
                         error_counts[err_key] = error_counts.get(err_key, 0) + 1
 
-                    error_df = pd.DataFrame([
-                        {"Error": k, "Count": v}
-                        for k, v in sorted(error_counts.items(), key=lambda x: -x[1])
-                    ])
+                    error_df = pd.DataFrame(
+                        [
+                            {"Error": k, "Count": v}
+                            for k, v in sorted(
+                                error_counts.items(), key=lambda x: -x[1]
+                            )
+                        ]
+                    )
                     st.dataframe(error_df, use_container_width=True)
                 else:
                     st.success("No errors recorded!")
@@ -336,12 +359,19 @@ def main():
                 col1, col2 = st.columns([1, 3])
                 with col1:
                     if st.button("🎲 Random Policy!", use_container_width=True):
-                        st.session_state.selected_policy_idx = random.randint(0, len(policies) - 1)
+                        st.session_state.selected_policy_idx = random.randint(
+                            0, len(policies) - 1
+                        )
 
                 with col2:
                     filter_option = st.selectbox(
                         "Filter policies:",
-                        ["All", "Valid & Rewarded", "Valid but Zero Reward", "Invalid/Error"],
+                        [
+                            "All",
+                            "Valid & Rewarded",
+                            "Valid but Zero Reward",
+                            "Invalid/Error",
+                        ],
                     )
 
                 # Filter policies based on selection
@@ -349,11 +379,14 @@ def main():
                     filtered_policies = [p for p in policies if p.get("reward", 0) > 0]
                 elif filter_option == "Valid but Zero Reward":
                     filtered_policies = [
-                        p for p in policies
+                        p
+                        for p in policies
                         if p.get("valid", False) and p.get("reward", 0) == 0
                     ]
                 elif filter_option == "Invalid/Error":
-                    filtered_policies = [p for p in policies if not p.get("valid", False)]
+                    filtered_policies = [
+                        p for p in policies if not p.get("valid", False)
+                    ]
                 else:
                     filtered_policies = policies
 
@@ -361,22 +394,38 @@ def main():
                     # Sort options
                     sort_option = st.selectbox(
                         "Sort by:",
-                        ["Step (ascending)", "Step (descending)", "Reward (highest first)", "Reward (lowest first)"],
+                        [
+                            "Step (ascending)",
+                            "Step (descending)",
+                            "Reward (highest first)",
+                            "Reward (lowest first)",
+                        ],
                     )
 
                     if sort_option == "Step (descending)":
-                        filtered_policies = sorted(filtered_policies, key=lambda p: p.get("step", 0), reverse=True)
+                        filtered_policies = sorted(
+                            filtered_policies,
+                            key=lambda p: p.get("step", 0),
+                            reverse=True,
+                        )
                     elif sort_option == "Reward (highest first)":
-                        filtered_policies = sorted(filtered_policies, key=lambda p: p.get("reward", 0), reverse=True)
+                        filtered_policies = sorted(
+                            filtered_policies,
+                            key=lambda p: p.get("reward", 0),
+                            reverse=True,
+                        )
                     elif sort_option == "Reward (lowest first)":
-                        filtered_policies = sorted(filtered_policies, key=lambda p: p.get("reward", 0))
+                        filtered_policies = sorted(
+                            filtered_policies, key=lambda p: p.get("reward", 0)
+                        )
 
                     # Show slider to browse policies
                     idx = st.slider(
                         "Browse policies:",
                         0,
                         len(filtered_policies) - 1,
-                        st.session_state.get("selected_policy_idx", 0) % len(filtered_policies),
+                        st.session_state.get("selected_policy_idx", 0)
+                        % len(filtered_policies),
                         key="policy_slider",
                     )
                     display_policy(filtered_policies[idx])
