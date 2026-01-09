@@ -2,7 +2,6 @@
 
 import re
 from pathlib import Path
-from datetime import datetime
 import statistics
 import time
 import litellm
@@ -13,6 +12,7 @@ from eudoxia.__main__ import SCHEDULER_TEMPLATE
 
 # Global cost tracking
 _response_costs = []
+_last_request_cost = None  # Track cost of most recent request
 
 
 def build_system_context(files=[], sections={}):
@@ -120,6 +120,12 @@ def generate_policy_with_llm(
                          representing previous attempts and their outcomes
         model: The LLM model to use for generation
         temperature: Temperature parameter for LLM sampling
+
+    Returns:
+        tuple: (generated_content, messages, llm_params) where:
+            - generated_content: The LLM's response content
+            - messages: The full message list sent to the LLM
+            - llm_params: Dict with model, temperature, reasoning_effort used
     """
 
     assert system_context is not None, "System context must be provided"
@@ -146,7 +152,7 @@ def generate_policy_with_llm(
             messages.append({"role": "user", "content": entry["feedback"]})
 
     reasoning_effort = None
-    if model == "gpt-5" or model == "gpt-5-mini" or model.startswith("claude-opus-4"):
+    if model.startswith("gpt-5") or model.startswith("claude-opus-4"):
         # leverage advanced capabilities and override the reasoning effort
         reasoning_effort = "high"
         temperature = 1
@@ -160,19 +166,24 @@ def generate_policy_with_llm(
     )
     print(f"got response from {model}")
 
-    return response.choices[0].message.content
+    llm_params = {
+        "model": model,
+        "temperature": temperature,
+        "reasoning_effort": reasoning_effort,
+    }
+
+    return response.choices[0].message.content, messages, llm_params
 
 
-def generate_and_save_policy(
+def generate_policy(
     user_request, feedback_history, model, temperature, policy_key, verbose=False
 ):
-    """Generate a policy and save it to file, returning the code, name, key, and filepath.
+    """Generate a policy using LLM.
 
     This function encapsulates all policy generation work:
     - Building context
     - Generating policy with LLM
     - Cleaning the generated code
-    - Saving to file
     - Extracting the scheduler key
 
     Args:
@@ -181,10 +192,13 @@ def generate_and_save_policy(
         feedback_history: Optional list of previous attempts with feedback
         model: The LLM model to use for generation
         temperature: Temperature parameter for LLM sampling
-        policy_key: The policy key to use for naming the file and registering the scheduler
+        policy_key: The policy key to use for registering the scheduler
 
     Returns:
-        tuple: (policy_code, filepath)
+        dict: Dictionary containing:
+            - policy_code: The cleaned generated code
+            - llm_messages: Full message list sent to LLM
+            - llm_params: Dict with model, temperature, reasoning_effort used
     """
     import re
 
@@ -210,15 +224,12 @@ def generate_and_save_policy(
         if feedback_history:
             print(f"Using feedback from {len(feedback_history)} previous attempt(s)")
 
-    generated_code = generate_policy_with_llm(
+    generated_code, llm_messages, llm_params = generate_policy_with_llm(
         user_request, system_context, feedback_history, model, temperature
     )
 
     # Clean the code
     generated_code = clean_generated_code(generated_code)
-
-    # Save to file
-    filepath = save_policy_to_file(generated_code, user_request, policy_key)
 
     # Extract the policy key from the generated code to verify it matches
     # Handle both @register_scheduler("key") and @register_scheduler(key="key") syntax
@@ -228,7 +239,11 @@ def generate_and_save_policy(
         f"Extracted key '{extracted_key}' does not match expected key '{policy_key}'"
     )
 
-    return generated_code, str(filepath)
+    return {
+        "policy_code": generated_code,
+        "llm_messages": llm_messages,
+        "llm_params": llm_params,
+    }
 
 
 def clean_generated_code(generated_code):
@@ -244,42 +259,6 @@ def clean_generated_code(generated_code):
     return generated_code
 
 
-def save_policy_to_file(policy_code, user_request, policy_key):
-    """Save generated policy code to a file with a memorable random name
-
-    Args:
-        policy_code: The generated policy code
-        user_request: The original user request
-        policy_key: Policy key to use as the base filename
-
-    Returns:
-        filepath: Path to the saved policy file
-    """
-    # Create a memorable filename using wonderwords
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Create filename with timestamp for uniqueness
-    filename = f"{policy_key}_{timestamp}.py"
-
-    # Save to file
-    policies_dir = Path("policies")
-    policies_dir.mkdir(exist_ok=True)
-
-    filepath = policies_dir / filename
-    with open(filepath, "w") as f:
-        f.write(
-            f'"""\nGenerated Policy: {policy_key}\nRequest: {user_request}\nTimestamp: {timestamp}\n"""\n\n'
-        )
-        f.write(policy_code)
-
-    print(f"\n{'=' * 60}")
-    print(f"Policy saved as: {policy_key}")
-    print(f"Full path: {filepath}")
-    print(f"{'=' * 60}\n")
-
-    return filepath
-
-
 def setup_cost_tracking():
     """Set up cost tracking callback for litellm"""
 
@@ -289,11 +268,14 @@ def setup_cost_tracking():
         start_time,
         end_time,  # start/end time
     ):
+        global _last_request_cost
         try:
             response_cost = kwargs.get("response_cost", 0)
             print("\n\nResponse_cost", response_cost)
             # Store cost in global array
             _response_costs.append(response_cost)
+            # Track cost of most recent request
+            _last_request_cost = response_cost
         except Exception:
             # Silently ignore cost tracking errors
             pass
@@ -303,8 +285,18 @@ def setup_cost_tracking():
 
 def reset_cost_tracking():
     """Reset the cost tracking array"""
-    global _response_costs
+    global _response_costs, _last_request_cost
     _response_costs = []
+    _last_request_cost = None
+
+
+def get_last_request_cost():
+    """Get the cost of the most recent LLM request.
+
+    Returns:
+        float: Cost of the last request, or 0.0 if not available
+    """
+    return _last_request_cost if _last_request_cost is not None else 0.0
 
 
 def get_cost_statistics():
