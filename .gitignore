@@ -215,3 +215,7 @@ policies/
 training_logs/
 
 .claude/
+
+experiment_runs/
+
+*.png
